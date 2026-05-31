@@ -1,0 +1,3757 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
+
+try:
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+    VIDEO_AVAILABLE = True
+except Exception:
+    cv2 = None
+    mp = None
+    mp_python = None
+    mp_vision = None
+    VIDEO_AVAILABLE = False
+import os
+import serial
+import serial.tools.list_ports
+import threading
+import time
+import math
+import json
+import csv
+import numpy as np
+from collections import deque
+from datetime import datetime
+
+import sys
+
+def resource_path(relative_path: str) -> str:
+    base_path = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    return os.path.join(base_path, relative_path)
+
+APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+
+LOGO_FILE = resource_path("logo.png")
+CALIBRATION_FILE = os.path.join(APP_DIR, "emg_model_calibration.txt")
+RESULTS_DIR = os.path.join(APP_DIR, "emg_test_results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except Exception:
+    TTS_AVAILABLE = False
+
+
+# =========================================================
+# Settings
+# =========================================================
+USE_INDEPENDENT_MUSCLE_MODE = True
+USE_WL_ONLY_MODE = False
+# The old mode-switch EMG percentage path used WL-only regression.
+# Keep chest/deltoid Full-Arm state calibration unchanged, but calculate
+# hand, biceps, triceps, and chest percentages exactly with that WL-only path.
+MODE_SWITCH_PERCENT_MUSCLES = {"hand", "biceps", "triceps", "chest"}
+
+# Body-action prototype classifier: hand/gripper remains independent.
+BODY_CHANNELS = ["biceps", "triceps", "deltoid", "chest"]
+BODY_ACTION_REST = "BODY_REST"
+BODY_ACTION_ARM_CLOSE = "ARM_CLOSE"
+BODY_ACTION_ARM_EXTEND = "ARM_EXTEND"
+BODY_ACTION_HEIGHT_UP = "HEIGHT_UP"
+BODY_ACTION_HEIGHT_DOWN = "HEIGHT_DOWN"
+BODY_ACTION_CHEST_ACTIVE = "CHEST_ACTIVE"
+BODY_ACTION_CLASSES = [
+    BODY_ACTION_REST,
+    BODY_ACTION_ARM_CLOSE,
+    BODY_ACTION_ARM_EXTEND,
+    BODY_ACTION_HEIGHT_UP,
+    BODY_ACTION_HEIGHT_DOWN,
+    BODY_ACTION_CHEST_ACTIVE,
+]
+BODY_FEATURE_HISTORY_LEN = 7
+BODY_CLASSIFIER_MIN_MARGIN = 0.8
+BODY_CLASSIFIER_MIN_STD = 0.20
+BODY_CONFIRM_SAMPLES = 5
+
+# Deltoid arm-down classification mode:
+# - False: use the current body-action prototype classifier exactly as before.
+# - True : classify arm-down separately from the body-action classifier.
+#          If, in the last DELTOID_ZERO_ARM_DOWN_WINDOW_SEC seconds, more than
+#          DELTOID_ZERO_ARM_DOWN_RATIO of the deltoid feature measurements have
+#          RMS == 0 OR MAV == 0 OR WL == 0, then the body action is forced to
+#          HEIGHT_DOWN. Otherwise HEIGHT_DOWN is excluded from the normal body
+#          classifier, so arm-down cannot be selected by closeness to the body
+#          prototypes.
+USE_DELTOID_ZERO_ARM_DOWN_OVERRIDE = True
+DELTOID_ZERO_ARM_DOWN_WINDOW_SEC = 1.2
+DELTOID_ZERO_ARM_DOWN_RATIO = 0.85
+DELTOID_ZERO_EPS = 0.0
+
+BAUD_RATE = 115200
+SERIAL_TIMEOUT = 0.05
+WINDOW_SIZE = 80
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if USE_WL_ONLY_MODE:
+    CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "emg_model_calibration_wl_only.txt")
+else:
+    CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "emg_model_calibration.txt")
+
+LOGO_FILE = os.path.join(SCRIPT_DIR, "logo.png")
+RESULTS_DIR = os.path.join(SCRIPT_DIR, "emg_test_results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# internal names stay the same
+MUSCLES = ["hand", "biceps", "triceps", "deltoid", "chest"]
+DISPLAY_NAMES = {
+    "hand": "Hand",
+    "biceps": "Biceps",
+    "triceps": "Triceps",
+    "deltoid": "Deltoid",
+    "chest": "Chest",
+}
+
+def display_name_for_mode(muscle, app_mode=None):
+    return DISPLAY_NAMES.get(muscle, muscle)
+
+CALIB_MEASUREMENTS_PER_STAGE = 1
+COUNTDOWN_SECONDS = 6.0
+CAPTURE_WINDOW_SEC = 1.4
+
+UI_REFRESH_MS = 50
+ENABLE_VOICE = True
+SEND_SERVO_COMMANDS_TO_ARDUINO = True
+
+MODE_SWITCH_THRESHOLD = 70.0
+MODE_RELEASE_THRESHOLD = 40.0
+PLUS_THRESHOLD = 70.0
+MINUS_THRESHOLD = 70.0
+
+HAND_SWITCH_AVG_SECONDS = 1.6
+MODE_SWITCH_LOCKOUT_SEC = 2.0
+CONTROL_REPEAT_SEC = 0.12
+CHEST_RELAX_CONFIRM_SEC = 0.05
+CHEST_ACTIVE_CONFIRM_SEC = 1.0
+HAND_OPEN_CONFIRM_SEC = CHEST_RELAX_CONFIRM_SEC
+# In Full-Arm mode the hand must stay closed/high for 1 s before the gripper-closing state is accepted.
+HAND_CLOSED_CONFIRM_SEC = 1.5
+# Chest is now a two-level toggle controller: low/off and high/active.
+CHEST_HIGH_CONFIRM_SEC = CHEST_ACTIVE_CONFIRM_SEC
+CHEST_LOW_CONFIRM_SEC = CHEST_RELAX_CONFIRM_SEC
+# Separate control-layer debounce for chest direction toggling.
+# A brief false OFF spike should stop the current rotation command for that
+# instant, but it must not arm the opposite rotation direction unless chest
+# has stayed inactive for this full duration.
+CHEST_ROTATION_RELEASE_CONFIRM_SEC = 1.0
+BICEPS_RELAX_CONFIRM_SEC = CHEST_RELAX_CONFIRM_SEC
+BICEPS_ACTIVE_CONFIRM_SEC = CHEST_ACTIVE_CONFIRM_SEC
+DELTOID_RELAX_CONFIRM_SEC = CHEST_RELAX_CONFIRM_SEC
+DELTOID_ACTIVE_CONFIRM_SEC = CHEST_ACTIVE_CONFIRM_SEC
+
+ANGLE_STEP = 0.2 * 1.0 * 10 * 3
+HEIGHT_STEP = 0.04 * 0.3 * 10 * 3
+DIST_STEP = 0.04 * 0.3 * 10 * 3
+GRIPPER_STEP = 5 * 0.2 * 1.0 * 10
+TWIST_STEP = 2 * 0.2 * 1.0 *10 * 1.5 * 1.5
+
+ANGLE_MIN, ANGLE_MAX = -180.0, 180.0
+HEIGHT_MIN, HEIGHT_MAX = 0.0, 50.0
+DIST_MIN, DIST_MAX = 0.0, 23.0
+GRIP_MIN, GRIP_MAX = 40.0, 160.0
+TWIST_MIN, TWIST_MAX = -180.0, 180.0
+
+APP_MODE_FULL_ARM_EMG = "Full-Arm EMG Mode"
+APP_MODE_EMG = APP_MODE_FULL_ARM_EMG
+APP_MODE_KEYBOARD = "Keyboard Control"
+APP_MODE_POSITION = "Position Control"
+APP_MODE_VIDEO = "Video Based"
+APP_MODES = [APP_MODE_FULL_ARM_EMG, APP_MODE_KEYBOARD, APP_MODE_POSITION, APP_MODE_VIDEO]
+
+def is_emg_app_mode(mode):
+    return mode == APP_MODE_FULL_ARM_EMG
+
+
+POSE_MODEL_PATH = os.path.join(SCRIPT_DIR, "pose_landmarker.task")
+HAND_MODEL_PATH = os.path.join(SCRIPT_DIR, "hand_landmarker.task")
+CAMERA_INDEX = 0
+VIDEO_PREVIEW_WIDTH = 640
+VIDEO_PREVIEW_HEIGHT = 360
+VIDEO_SMOOTHING_SEC = 1.0
+VIDEO_TWIST_SMOOTHING_SEC = 1.5
+VIDEO_TWIST_SWITCH_MAJORITY = 0.60
+VIDEO_SPEED_MULTIPLIER = 4.0
+VIDEO_DISTANCE_SCALE = 25.0
+VIDEO_HEIGHT_SCALE = 25.0
+SETTINGS_FILE = os.path.join(SCRIPT_DIR, "emg_app_settings.txt")
+
+DEFAULT_KEY_BINDINGS = {
+    "distance_plus": "w",
+    "distance_minus": "s",
+    "angle_minus": "d",
+    "angle_plus": "a",
+    "height_plus": "up",
+    "height_minus": "down",
+    "twist_minus": "left",
+    "twist_plus": "right",
+    "gripper_plus": "space",
+    "gripper_minus": "control_l",
+}
+
+DEFAULT_APP_SETTINGS = {
+    "sound_level": 0.8,
+    "graphics_enabled": True,
+    "video_arm_side": "right",
+    "video_grip_on_threshold": 70.0,
+    "video_grip_off_threshold": 40.0,
+    "key_bindings": DEFAULT_KEY_BINDINGS.copy(),
+    "activation_limits": {
+        "mode_switch_threshold": MODE_SWITCH_THRESHOLD,
+        "mode_release_threshold": MODE_RELEASE_THRESHOLD,
+        "plus_threshold": PLUS_THRESHOLD,
+        "minus_threshold": MINUS_THRESHOLD,
+    },
+}
+
+SERVO1_LIMIT_MIN, SERVO1_LIMIT_MAX = -90.0, 80.0
+SERVO2_LIMIT_MIN, SERVO2_LIMIT_MAX = -10.0, 150.0
+SERVO3_LIMIT_MIN, SERVO3_LIMIT_MAX = -90.0, 90.0
+
+BASEHEIGHT = 9.1
+LINK1 = 10.3
+LINK2 = 14.0
+GRIPPER_BASE_LENGTH = 6.85
+
+INITIAL_SERVO_ANGLES = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+INITIAL_DES_ANGLE = 0.0
+INITIAL_DES_HEIGHT = 11.0
+INITIAL_DES_DISTANCE = 14.0
+INITIAL_DES_GRIPPER = -50.0
+INITIAL_DES_TWIST = -180
+
+TEST_COUNTDOWN_SECONDS = 3.5
+TEST_CAPTURE_SECONDS = 2.0
+TEST_BETWEEN_STEPS_SECONDS = 1.0
+ACTIVE_PASS_THRESHOLD = 55.0
+REST_PASS_THRESHOLD = 35.0
+
+TEST_PROTOCOL = [
+    {"name": "hand_close_1", "instruction": "Close your hand now", "expected_muscle": "hand", "expected_state": "high"},
+    {"name": "hand_open_1", "instruction": "Open your hand now", "expected_muscle": "hand", "expected_state": "low"},
+    {"name": "hand_close_2", "instruction": "Close your hand now", "expected_muscle": "hand", "expected_state": "high"},
+    {"name": "hand_open_2", "instruction": "Open your hand now", "expected_muscle": "hand", "expected_state": "low"},
+    {"name": "hand_close_3", "instruction": "Close your hand now", "expected_muscle": "hand", "expected_state": "high"},
+    {"name": "hand_open_3", "instruction": "Open your hand now", "expected_muscle": "hand", "expected_state": "low"},
+
+    {"name": "arm_close_1", "instruction": "Close your arm now", "expected_muscle": "biceps", "expected_state": "high"},
+    {"name": "arm_open_1", "instruction": "Open your arm now", "expected_muscle": "triceps", "expected_state": "high"},
+    {"name": "arm_close_2", "instruction": "Close your arm now", "expected_muscle": "biceps", "expected_state": "high"},
+    {"name": "arm_open_2", "instruction": "Open your arm now", "expected_muscle": "triceps", "expected_state": "high"},
+    {"name": "arm_close_3", "instruction": "Close your arm now", "expected_muscle": "biceps", "expected_state": "high"},
+    {"name": "arm_open_3", "instruction": "Open your arm now", "expected_muscle": "triceps", "expected_state": "high"},
+]
+
+FULL_ARM_TEST_PROTOCOL = [
+    # User-requested Full-Arm test sequence.
+    # These expected_muscle / expected_state values are the same discrete
+    # states used by full_arm_expected_state_matches().
+    {"name": "hand_close_1", "instruction": "Close hand", "expected_muscle": "hand", "expected_state": "closed"},
+    {"name": "arm_close_1", "instruction": "Close arm", "expected_muscle": "biceps", "expected_state": "plus"},
+    {"name": "hand_open_1", "instruction": "Open hand", "expected_muscle": "hand", "expected_state": "open"},
+    {"name": "arm_relax_1", "instruction": "Relax arm", "expected_muscle": "both_arm", "expected_state": "off"},
+    {"name": "arm_extend_1", "instruction": "Extend arm", "expected_muscle": "triceps", "expected_state": "minus"},
+    {"name": "hand_close_2", "instruction": "Close hand", "expected_muscle": "hand", "expected_state": "closed"},
+    {"name": "arm_relax_2", "instruction": "Relax arm", "expected_muscle": "both_arm", "expected_state": "off"},
+    {"name": "raise_arm_1", "instruction": "Raise arm", "expected_muscle": "deltoid", "expected_state": "up"},
+    {"name": "hand_open_2", "instruction": "Open hand", "expected_muscle": "hand", "expected_state": "open"},
+    {"name": "height_relax_1", "instruction": "Relax arm height", "expected_muscle": "deltoid", "expected_state": "off"},
+    {"name": "drop_arm_down_1", "instruction": "Drop arm down", "expected_muscle": "deltoid", "expected_state": "down"},
+    {"name": "height_relax_2", "instruction": "Relax arm height", "expected_muscle": "deltoid", "expected_state": "off"},
+    {"name": "hand_close_3", "instruction": "Close hand", "expected_muscle": "hand", "expected_state": "closed"},
+    {"name": "chest_activate_1", "instruction": "Activate chest", "expected_muscle": "chest", "expected_state": "plus"},
+    {"name": "chest_relax_1", "instruction": "Relax chest", "expected_muscle": "chest", "expected_state": "off"},
+    {"name": "hand_open_3", "instruction": "Open hand", "expected_muscle": "hand", "expected_state": "open"},
+]
+
+
+# =========================================================
+# Helpers
+# =========================================================
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def compute_features(samples):
+    samples = list(samples)
+    n = len(samples)
+    if n == 0:
+        return {"rms": 0.0, "mav": 0.0, "wl": 0.0}
+    rms = math.sqrt(sum(x * x for x in samples) / n)
+    mav = sum(abs(x) for x in samples) / n
+    wl = sum(abs(samples[i] - samples[i - 1]) for i in range(1, n))
+    return {"rms": rms, "mav": mav, "wl": wl}
+
+
+def build_feature_vector(feature_dict):
+    x = []
+    for muscle in MUSCLES:
+        if USE_WL_ONLY_MODE:
+            x.append(feature_dict[muscle]["wl"])
+        else:
+            x.append(feature_dict[muscle]["rms"])
+            x.append(feature_dict[muscle]["mav"])
+            x.append(feature_dict[muscle]["wl"])
+    return np.array(x, dtype=float)
+
+
+def get_model_input_vector(feature_dict, target_muscle):
+    if USE_INDEPENDENT_MUSCLE_MODE:
+        if USE_WL_ONLY_MODE or target_muscle in MODE_SWITCH_PERCENT_MUSCLES:
+            return np.array([feature_dict[target_muscle]["wl"]], dtype=float)
+        return np.array([
+            feature_dict[target_muscle]["rms"],
+            feature_dict[target_muscle]["mav"],
+            feature_dict[target_muscle]["wl"],
+        ], dtype=float)
+    return build_feature_vector(feature_dict)
+
+
+def expand_features_basis(x):
+    x = np.asarray(x, dtype=float)
+    return np.concatenate([np.array([1.0]), x])
+
+
+def fit_least_squares_model(samples):
+    if len(samples) < 2:
+        return None
+    X = []
+    y = []
+    for s in samples:
+        X.append(expand_features_basis(s["x"]))
+        y.append(float(s["y"]))
+    X = np.array(X, dtype=float)
+    y = np.array(y, dtype=float)
+    coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    return {"type": "linear_ls", "coeffs": coeffs.tolist()}
+
+
+def predict_with_model(model, x):
+    if model is None:
+        return 0.0
+    phi = expand_features_basis(x)
+    coeffs = np.array(model["coeffs"], dtype=float)
+    if phi.shape[0] != coeffs.shape[0]:
+        return 0.0
+    y = float(phi @ coeffs)
+    return clamp(y, 0.0, 100.0)
+
+
+
+
+def load_app_settings():
+    settings = json.loads(json.dumps(DEFAULT_APP_SETTINGS))
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            settings.update({k: v for k, v in loaded.items() if k in settings})
+            if isinstance(loaded.get("key_bindings"), dict):
+                settings["key_bindings"] = DEFAULT_KEY_BINDINGS.copy()
+                settings["key_bindings"].update(loaded["key_bindings"])
+            if isinstance(loaded.get("activation_limits"), dict):
+                settings["activation_limits"] = DEFAULT_APP_SETTINGS["activation_limits"].copy()
+                settings["activation_limits"].update(loaded["activation_limits"])
+    except Exception:
+        pass
+    return settings
+
+
+def save_app_settings(settings):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+        return True
+    except Exception as e:
+        print("Settings save failed:", e)
+        return False
+
+
+def normalize_key_name(key):
+    key = str(key).strip().lower()
+    aliases = {
+        "ctrl": "control_l",
+        "control": "control_l",
+        "left ctrl": "control_l",
+        "right ctrl": "control_r",
+        "spacebar": "space",
+        "space": "space",
+        "uparrow": "up",
+        "up arrow": "up",
+        "downarrow": "down",
+        "down arrow": "down",
+        "leftarrow": "left",
+        "left arrow": "left",
+        "rightarrow": "right",
+        "right arrow": "right",
+    }
+    return aliases.get(key, key)
+
+
+def key_display_name(key):
+    names = {
+        "space": "Spacebar",
+        "control_l": "Ctrl",
+        "control_r": "Right Ctrl",
+        "up": "UP arrow",
+        "down": "DOWN arrow",
+        "left": "LEFT arrow",
+        "right": "RIGHT arrow",
+    }
+    return names.get(key, key.upper() if len(key) == 1 else key)
+
+# =========================================================
+# Serial reader
+# =========================================================
+class SerialReader(threading.Thread):
+    def __init__(self, port, baudrate, packet_callback, status_callback=None):
+        super().__init__(daemon=True)
+        self.port = port
+        self.baudrate = baudrate
+        self.packet_callback = packet_callback
+        self.status_callback = status_callback
+        self.stop_event = threading.Event()
+        self.ser = None
+        self.write_lock = threading.Lock()
+
+    def run(self):
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=SERIAL_TIMEOUT)
+            if self.status_callback:
+                self.status_callback(f"Connected to {self.port}")
+        except Exception as e:
+            if self.status_callback:
+                self.status_callback(f"Connection failed: {e}")
+            return
+
+        while not self.stop_event.is_set():
+            try:
+                line = self.ser.readline().decode(errors="ignore").strip()
+                if not line:
+                    continue
+
+                if line.startswith("R,"):
+                    parts = line.split(",")
+                    if len(parts) != 6:
+                        continue
+                    vals = [float(v.strip()) for v in parts[1:]]
+                    self.packet_callback({
+                        "type": "emg",
+                        "hand": vals[0],
+                        "biceps": vals[1],
+                        "deltoid": vals[2],
+                        "chest": vals[3],
+                        "triceps": vals[4],
+                    })
+
+                elif line.startswith("T,"):
+                    parts = line.split(",")
+
+                    # Backward compatible old format:
+                    #   T,combined_contact
+                    # New format:
+                    #   T,combined_contact,digital_contact,current_contact,current_avg_a0
+                    try:
+                        if len(parts) == 2:
+                            touch_val = int(parts[1].strip())
+                            self.packet_callback({
+                                "type": "touch",
+                                "touch": touch_val,
+                                "digital_touch": touch_val,
+                                "current_touch": 0,
+                                "current_avg": None,
+                            })
+
+                        elif len(parts) >= 5:
+                            combined_val = int(parts[1].strip())
+                            digital_val = int(parts[2].strip())
+                            current_val = int(parts[3].strip())
+                            current_avg = float(parts[4].strip())
+                            self.packet_callback({
+                                "type": "touch",
+                                "touch": combined_val,
+                                "digital_touch": digital_val,
+                                "current_touch": current_val,
+                                "current_avg": current_avg,
+                            })
+                    except Exception:
+                        continue
+
+            except Exception:
+                continue
+
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+        except Exception:
+            pass
+        if self.status_callback:
+            self.status_callback("Disconnected")
+
+    def write_line(self, line):
+        if not self.ser or not self.ser.is_open:
+            return
+        with self.write_lock:
+            self.ser.write(line.encode("utf-8"))
+
+    def stop(self):
+        self.stop_event.set()
+
+
+# =========================================================
+# Robot control
+# =========================================================
+class ControlMode:
+    ANGLE = 0
+    HEIGHT = 1
+    DISTANCE = 2
+    TWIST = 3
+    GRIPPER = 4
+    COUNT = 5
+
+
+def mode_name(mode):
+    return {
+        ControlMode.ANGLE: "ANGLE",
+        ControlMode.HEIGHT: "HEIGHT",
+        ControlMode.DISTANCE: "DISTANCE",
+        ControlMode.TWIST: "TWIST",
+        ControlMode.GRIPPER: "GRIPPER",
+    }.get(mode, "UNKNOWN")
+
+
+class RobotController:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.servo_angles = INITIAL_SERVO_ANGLES[:]
+        self.servo_angles[4] = clamp(INITIAL_DES_TWIST, TWIST_MIN, TWIST_MAX)
+        self.des_angle = INITIAL_DES_ANGLE
+        self.des_height = INITIAL_DES_HEIGHT
+        self.des_distance = INITIAL_DES_DISTANCE
+        self.des_gripper = INITIAL_DES_GRIPPER
+        self.old_angle = INITIAL_DES_ANGLE
+        self.old_height = INITIAL_DES_HEIGHT
+        self.old_distance = INITIAL_DES_DISTANCE
+        self.old_gripper = INITIAL_DES_GRIPPER
+        self.current_mode = ControlMode.ANGLE
+        self.hand_history = deque()
+        self.hand_switch_armed = True
+        self.last_mode_switch_time = 0.0
+        self.last_control_step_time = 0.0
+        self.full_arm_states = {
+            "hand": "open",
+            "biceps": "off",
+            "triceps": "off",
+            "chest": "off",
+            "deltoid": "down",
+        }
+        self.run_ik_and_update_servos()
+
+    def safe_acos(self, x):
+        return math.acos(clamp(x, -1.0, 1.0))
+
+    def rad2deg(self, r):
+        return r * 180.0 / math.pi
+
+    def update_hand_average(self, hand_pct, now):
+        self.hand_history.append((now, float(hand_pct)))
+        while self.hand_history and (now - self.hand_history[0][0]) > HAND_SWITCH_AVG_SECONDS:
+            self.hand_history.popleft()
+
+    def get_hand_average(self):
+        if not self.hand_history:
+            return 0.0
+        return sum(v for _, v in self.hand_history) / len(self.hand_history)
+
+    def update_mode_switch_logic(self, percentages, now):
+        self.update_hand_average(percentages["hand"], now)
+        hand_avg = self.get_hand_average()
+
+        if hand_avg < MODE_RELEASE_THRESHOLD:
+            self.hand_switch_armed = True
+
+        if (now - self.last_mode_switch_time) > MODE_SWITCH_LOCKOUT_SEC:
+            self.hand_switch_armed = True
+
+        if self.hand_switch_armed and hand_avg > MODE_SWITCH_THRESHOLD:
+            self.current_mode = (self.current_mode + 1) % ControlMode.COUNT
+            self.last_mode_switch_time = now
+            self.last_control_step_time = now
+            self.hand_switch_armed = False
+            self.hand_history.clear()
+
+    def apply_mode_step(self, direction, touch_count):
+        if self.current_mode == ControlMode.ANGLE:
+            self.des_angle = self.old_angle + direction * ANGLE_STEP
+        elif self.current_mode == ControlMode.HEIGHT:
+            self.des_height = self.old_height + direction * HEIGHT_STEP
+        elif self.current_mode == ControlMode.DISTANCE:
+            self.des_distance = self.old_distance + direction * DIST_STEP
+        elif self.current_mode == ControlMode.TWIST:
+            self.servo_angles[4] += direction * TWIST_STEP
+        elif self.current_mode == ControlMode.GRIPPER:
+            if direction < 0:
+                self.des_gripper = self.old_gripper - GRIPPER_STEP
+            elif direction > 0 and touch_count < 1:
+                self.des_gripper = self.old_gripper + GRIPPER_STEP
+
+    def update_desired_from_percentages(self, percentages, touch_count, now):
+        self.update_mode_switch_logic(percentages, now)
+
+        plus_active = percentages["biceps"] > PLUS_THRESHOLD
+        minus_active = percentages["triceps"] > MINUS_THRESHOLD
+
+        if plus_active and minus_active:
+            plus_active = False
+            minus_active = False
+
+        if (now - self.last_control_step_time) >= CONTROL_REPEAT_SEC:
+            if plus_active:
+                self.apply_mode_step(+1, touch_count)
+                self.last_control_step_time = now
+            elif minus_active:
+                self.apply_mode_step(-1, touch_count)
+                self.last_control_step_time = now
+
+        self.des_angle = clamp(self.des_angle, ANGLE_MIN, ANGLE_MAX)
+        self.des_height = clamp(self.des_height, HEIGHT_MIN, HEIGHT_MAX)
+        self.des_distance = clamp(self.des_distance, DIST_MIN, DIST_MAX)
+        self.des_gripper = clamp(self.des_gripper, GRIP_MIN, GRIP_MAX)
+        self.servo_angles[4] = clamp(self.servo_angles[4], TWIST_MIN, TWIST_MAX)
+
+    def apply_full_arm_state_control(self, states, percentages, touch_count, now):
+        """Direct Full-Arm EMG control.
+
+        - Hand controls only the gripper: squeeze closes, release/open opens.
+        - Distance changes only when one arm muscle is clearly active and the
+          other arm muscle is clearly relaxed:
+              biceps > 70% and triceps < 40%  -> decrease distance
+              triceps > 70% and biceps < 40%  -> increase distance
+          During either valid distance command, deltoid input is ignored.
+        - Deltoid controls height only when there is no valid distance command.
+        - Chest keeps the existing Full-Arm behavior and remains blocked by
+          active distance control or high/up deltoid.
+        """
+        if (now - self.last_control_step_time) < CONTROL_REPEAT_SEC:
+            return
+
+        changed = False
+
+        hand_state = states.get("hand", self.full_arm_states.get("hand", "open"))
+        chest_state = states.get("chest", self.full_arm_states.get("chest", "off"))
+        deltoid_state = states.get("deltoid", self.full_arm_states.get("deltoid", "off"))
+
+        biceps_active = states.get("biceps") == "plus"
+        triceps_active = states.get("triceps") == "minus"
+        distance_active = biceps_active or triceps_active
+        deltoid_high = deltoid_state == "up"
+
+        # Hand/gripper is independent.
+        if hand_state == "closed":
+            if touch_count < 1:
+                self.des_gripper += GRIPPER_STEP
+                changed = True
+        elif hand_state == "open":
+            self.des_gripper -= GRIPPER_STEP
+            changed = True
+
+        # Deltoid controls height only when distance is not being controlled.
+        # Therefore, during a valid biceps/triceps distance command, deltoid is ignored.
+        if not distance_active:
+            if deltoid_state == "up":
+                self.des_height += HEIGHT_STEP
+                changed = True
+            elif deltoid_state == "down":
+                self.des_height -= HEIGHT_STEP
+                changed = True
+
+        # Distance changes only if one arm muscle is clearly active and the other is clearly relaxed.
+        # Reversed operation: biceps now gives -distance, triceps now gives +distance.
+        if biceps_active:
+            self.des_distance -= DIST_STEP
+            changed = True
+        elif triceps_active:
+            self.des_distance += DIST_STEP
+            changed = True
+
+        # Chest remains blocked by active distance control and by high/up deltoid.
+        if not deltoid_high and not distance_active:
+            if chest_state == "plus":
+                self.des_angle += ANGLE_STEP
+                changed = True
+            elif chest_state == "minus":
+                self.des_angle -= ANGLE_STEP
+                changed = True
+
+        if changed:
+            self.des_angle = clamp(self.des_angle, ANGLE_MIN, ANGLE_MAX)
+            self.des_height = clamp(self.des_height, HEIGHT_MIN, HEIGHT_MAX)
+            self.des_distance = clamp(self.des_distance, DIST_MIN, DIST_MAX)
+            self.des_gripper = clamp(self.des_gripper, GRIP_MIN, GRIP_MAX)
+            self.servo_angles[4] = clamp(self.servo_angles[4], TWIST_MIN, TWIST_MAX)
+            self.last_control_step_time = now
+
+    def run_ik_and_update_servos(self):
+        # EMG and keyboard control use the original behavior: unreachable
+        # height/distance commands are rejected instead of being remapped to
+        # the closest reachable point. Position/video target modes still use
+        # project_target_to_reachable_pose before calling this method.
+        des_height = self.des_height
+        des_distance = self.des_distance
+
+        l2_end_distance = des_distance - GRIPPER_BASE_LENGTH
+        l2_end_distance_2d = math.sqrt((l2_end_distance * l2_end_distance) + (des_height * des_height))
+
+        if des_height < (-1 * BASEHEIGHT):
+            des_height = self.old_height
+
+        if l2_end_distance_2d > (LINK1 + LINK2):
+            des_height = self.old_height
+            des_distance = self.old_distance
+        elif l2_end_distance_2d < abs(LINK1 - LINK2):
+            des_height = self.old_height
+            des_distance = self.old_distance
+
+        self.des_height = des_height
+        self.des_distance = des_distance
+        self.servo_angles[0] = self.des_angle
+
+        dx = self.des_distance - GRIPPER_BASE_LENGTH
+        l12 = math.sqrt(dx * dx + self.des_height * self.des_height)
+        lmin = abs(LINK1 - LINK2)
+        lmax = LINK1 + LINK2
+
+        if l12 < lmin or l12 > lmax:
+            return
+
+        theta12 = math.atan2(self.des_height, dx)
+        c1 = (LINK1 * LINK1 + l12 * l12 - LINK2 * LINK2) / (2.0 * LINK1 * l12)
+        c2 = (LINK1 * LINK1 + LINK2 * LINK2 - l12 * l12) / (2.0 * LINK1 * LINK2)
+
+        old_servo1 = self.servo_angles[1]
+        old_servo2 = self.servo_angles[2]
+        old_servo3 = self.servo_angles[3]
+
+        self.servo_angles[1] = self.rad2deg(math.pi / 2 - theta12 - self.safe_acos(c1))
+        self.servo_angles[2] = self.rad2deg(math.pi - self.safe_acos(c2))
+        self.servo_angles[3] = 90.0 - (self.servo_angles[1] + self.servo_angles[2])
+
+        if (
+            self.servo_angles[1] < SERVO1_LIMIT_MIN or self.servo_angles[1] > SERVO1_LIMIT_MAX or
+            self.servo_angles[2] < SERVO2_LIMIT_MIN or self.servo_angles[2] > SERVO2_LIMIT_MAX or
+            self.servo_angles[3] < SERVO3_LIMIT_MIN or self.servo_angles[3] > SERVO3_LIMIT_MAX
+        ):
+            self.servo_angles[1] = old_servo1
+            self.servo_angles[2] = old_servo2
+            self.servo_angles[3] = old_servo3
+            self.des_height = self.old_height
+            self.des_distance = self.old_distance
+
+        if not all(math.isfinite(v) for v in [self.servo_angles[1], self.servo_angles[2], self.servo_angles[3]]):
+            self.des_height = self.old_height
+            self.des_distance = self.old_distance
+
+        self.old_angle = self.des_angle
+        self.old_height = self.des_height
+        self.old_distance = self.des_distance
+        self.old_gripper = self.des_gripper
+
+    def validate_pose(self, angle, height, distance, gripper, twist=None):
+        """Return (True, message) if the requested Cartesian pose is allowed."""
+        if not (ANGLE_MIN <= angle <= ANGLE_MAX):
+            return False, f"Angle must be between {ANGLE_MIN:.1f} and {ANGLE_MAX:.1f}."
+        if not (HEIGHT_MIN <= height <= HEIGHT_MAX):
+            return False, f"Height must be between {HEIGHT_MIN:.1f} and {HEIGHT_MAX:.1f}."
+        if not (DIST_MIN <= distance <= DIST_MAX):
+            return False, f"Distance must be between {DIST_MIN:.1f} and {DIST_MAX:.1f}."
+        if not (GRIP_MIN <= gripper <= GRIP_MAX):
+            return False, f"Gripper must be between {GRIP_MIN:.1f} and {GRIP_MAX:.1f}."
+        if twist is not None and not (TWIST_MIN <= twist <= TWIST_MAX):
+            return False, f"Twist must be between {TWIST_MIN:.1f} and {TWIST_MAX:.1f}."
+
+        dx = distance - GRIPPER_BASE_LENGTH
+        l12 = math.sqrt(dx * dx + height * height)
+        lmin = abs(LINK1 - LINK2)
+        lmax = LINK1 + LINK2
+        if l12 < lmin or l12 > lmax:
+            return False, "Requested height/distance is outside the 2-link arm workspace."
+
+        theta12 = math.atan2(height, dx)
+        c1 = (LINK1 * LINK1 + l12 * l12 - LINK2 * LINK2) / (2.0 * LINK1 * l12)
+        c2 = (LINK1 * LINK1 + LINK2 * LINK2 - l12 * l12) / (2.0 * LINK1 * LINK2)
+        servo1 = self.rad2deg(math.pi / 2 - theta12 - self.safe_acos(c1))
+        servo2 = self.rad2deg(math.pi - self.safe_acos(c2))
+        servo3 = 90.0 - (servo1 + servo2)
+
+        if not all(math.isfinite(v) for v in [servo1, servo2, servo3]):
+            return False, "Requested pose gives non-finite IK angles."
+
+        if not (SERVO1_LIMIT_MIN <= servo1 <= SERVO1_LIMIT_MAX):
+            return False, f"Pose rejected: shoulder servo would be {servo1:.1f} deg."
+        if not (SERVO2_LIMIT_MIN <= servo2 <= SERVO2_LIMIT_MAX):
+            return False, f"Pose rejected: elbow servo would be {servo2:.1f} deg."
+        if not (SERVO3_LIMIT_MIN <= servo3 <= SERVO3_LIMIT_MAX):
+            return False, f"Pose rejected: wrist servo would be {servo3:.1f} deg."
+
+        return True, "Pose is reachable."
+
+    def project_target_to_reachable_pose(self, target):
+        """Return the closest reachable version of target instead of rejecting it.
+
+        This keeps all control modes from freezing when a command asks for a
+        height/distance pair outside the 2-link workspace or servo limits.
+        Angle, gripper, and twist are clamped first; then height/distance are
+        projected to the nearest valid pair using a geometric clamp plus a
+        small grid search for servo-limit cases.
+        """
+        projected = dict(target)
+        projected["angle"] = clamp(float(projected.get("angle", self.des_angle)), ANGLE_MIN, ANGLE_MAX)
+        projected["height"] = clamp(float(projected.get("height", self.des_height)), HEIGHT_MIN, HEIGHT_MAX)
+        projected["distance"] = clamp(float(projected.get("distance", self.des_distance)), DIST_MIN, DIST_MAX)
+        projected["gripper"] = clamp(float(projected.get("gripper", self.des_gripper)), GRIP_MIN, GRIP_MAX)
+        projected["twist"] = clamp(float(projected.get("twist", self.servo_angles[4])), TWIST_MIN, TWIST_MAX)
+
+        ok, msg = self.validate_pose(projected["angle"], projected["height"], projected["distance"], projected["gripper"], projected["twist"])
+        if ok:
+            return projected, False, msg
+
+        target_h = projected["height"]
+        target_d = projected["distance"]
+        best = None
+        best_score = None
+        best_msg = msg
+
+        # First, clamp geometrically to the annulus reachable by LINK1/LINK2.
+        dx_target = target_d - GRIPPER_BASE_LENGTH
+        vec_len = math.sqrt(dx_target * dx_target + target_h * target_h)
+        lmin = abs(LINK1 - LINK2) + 1e-3
+        lmax = LINK1 + LINK2 - 1e-3
+        if vec_len > 1e-9:
+            clamped_len = clamp(vec_len, lmin, lmax)
+            scale = clamped_len / vec_len
+            candidate = dict(projected)
+            candidate["height"] = clamp(target_h * scale, HEIGHT_MIN, HEIGHT_MAX)
+            candidate["distance"] = clamp(GRIPPER_BASE_LENGTH + dx_target * scale, DIST_MIN, DIST_MAX)
+            ok_c, msg_c = self.validate_pose(candidate["angle"], candidate["height"], candidate["distance"], candidate["gripper"], candidate["twist"])
+            if ok_c:
+                best = candidate
+                best_msg = msg_c
+                best_score = ((candidate["height"] - target_h) / max(1e-6, HEIGHT_MAX - HEIGHT_MIN)) ** 2 + ((candidate["distance"] - target_d) / max(1e-6, DIST_MAX - DIST_MIN)) ** 2
+
+        # Servo limits can still reject geometrically reachable points, so search nearby.
+        for h in np.linspace(HEIGHT_MIN, HEIGHT_MAX, 61):
+            for d in np.linspace(DIST_MIN, DIST_MAX, 61):
+                h = float(h)
+                d = float(d)
+                score = ((h - target_h) / max(1e-6, HEIGHT_MAX - HEIGHT_MIN)) ** 2 + ((d - target_d) / max(1e-6, DIST_MAX - DIST_MIN)) ** 2
+                if best_score is not None and score >= best_score:
+                    continue
+                ok_g, msg_g = self.validate_pose(projected["angle"], h, d, projected["gripper"], projected["twist"])
+                if ok_g:
+                    candidate = dict(projected)
+                    candidate["height"] = h
+                    candidate["distance"] = d
+                    best = candidate
+                    best_score = score
+                    best_msg = msg_g
+
+        if best is not None:
+            return best, True, "Target limited to the closest reachable pose."
+
+        # Fallback: keep current reachable height/distance, but still allow clamped angle/twist/gripper.
+        fallback = dict(projected)
+        fallback["height"] = self.old_height
+        fallback["distance"] = self.old_distance
+        ok_f, msg_f = self.validate_pose(fallback["angle"], fallback["height"], fallback["distance"], fallback["gripper"], fallback["twist"])
+        if ok_f:
+            return fallback, True, "Target limited: keeping current reachable height/distance."
+
+        return {
+            "angle": self.old_angle,
+            "height": self.old_height,
+            "distance": self.old_distance,
+            "gripper": self.old_gripper,
+            "twist": self.servo_angles[4],
+        }, True, best_msg
+
+    def limit_current_desired_to_reachable_pose(self):
+        target = {
+            "angle": self.des_angle,
+            "height": self.des_height,
+            "distance": self.des_distance,
+            "gripper": self.des_gripper,
+            "twist": self.servo_angles[4],
+        }
+        projected, was_limited, _ = self.project_target_to_reachable_pose(target)
+        self.des_angle = projected["angle"]
+        self.des_height = projected["height"]
+        self.des_distance = projected["distance"]
+        self.des_gripper = projected["gripper"]
+        self.servo_angles[4] = projected["twist"]
+        return was_limited
+
+    def step_towards_position_target(self, target, speed_multiplier=1.0):
+        """Move desired values slowly toward the closest reachable version of target."""
+        if target is None:
+            return True
+
+        target, _, _ = self.project_target_to_reachable_pose(target)
+
+        def step_value(current, desired, step):
+            if abs(desired - current) <= step:
+                return desired
+            return current + step if desired > current else current - step
+
+        m = max(0.0, float(speed_multiplier))
+        self.des_angle = step_value(self.des_angle, target["angle"], ANGLE_STEP * m)
+        self.des_height = step_value(self.des_height, target["height"], HEIGHT_STEP * m)
+        self.des_distance = step_value(self.des_distance, target["distance"], DIST_STEP * m)
+        self.des_gripper = step_value(self.des_gripper, target["gripper"], GRIPPER_STEP * m)
+        self.servo_angles[4] = step_value(self.servo_angles[4], target["twist"], TWIST_STEP * m)
+        self.servo_angles[4] = clamp(self.servo_angles[4], TWIST_MIN, TWIST_MAX)
+
+        self.run_ik_and_update_servos()
+
+        return (
+            abs(self.des_angle - target["angle"]) < 1e-6 and
+            abs(self.des_height - target["height"]) < 1e-6 and
+            abs(self.des_distance - target["distance"]) < 1e-6 and
+            abs(self.des_gripper - target["gripper"]) < 1e-6 and
+            abs(self.servo_angles[4] - target["twist"]) < 1e-6
+        )
+
+    def get_servo_command_line(self):
+        return "S,{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}\n".format(
+            self.servo_angles[0],
+            self.servo_angles[1],
+            self.servo_angles[2],
+            self.servo_angles[3],
+            self.servo_angles[4],
+            self.des_gripper,
+        )
+
+
+# =========================================================
+# Main app
+# =========================================================
+class EMGApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Limb++ GUI App")
+        self.root.geometry("1320x900")
+
+        self.logo_img = None
+        self.logo_label = None
+        self.serial_reader = None
+        self.connected = False
+
+        self.buffers = {m: deque(maxlen=WINDOW_SIZE) for m in MUSCLES}
+        self.latest_packet = {m: 0.0 for m in MUSCLES}
+        self.features = {m: {"rms": 0.0, "mav": 0.0, "wl": 0.0} for m in MUSCLES}
+        self.predicted_percentages = {m: 0.0 for m in MUSCLES}
+        self.training_data = {m: [] for m in MUSCLES}
+        self.models = {m: None for m in MUSCLES}
+        self.full_arm_calibration = self.empty_full_arm_calibration()
+        self.body_action_calibration = self.empty_body_action_calibration()
+        self.body_action_model = None
+        self.body_feature_history = deque(maxlen=BODY_FEATURE_HISTORY_LEN)
+        self.deltoid_zero_feature_history = deque()
+        self.body_current_action = BODY_ACTION_REST
+        self.body_pending_action = BODY_ACTION_REST
+        self.body_pending_count = 0
+        self.body_last_distances = {}
+        self.body_last_confidence = 0.0
+        self.full_arm_states = {
+            "hand": "open",
+            "biceps": "off",
+            "triceps": "off",
+            "chest": "off",
+            "deltoid": "down",
+        }
+        self.chest_pending_state = "off"
+        self.chest_pending_since = time.time()
+        self.chest_high_active = False
+        self.chest_current_direction = "plus"
+        self.chest_next_direction = "plus"
+        self.chest_release_candidate_since = None
+        self.hand_pending_state = "open"
+        self.hand_pending_since = time.time()
+        self.biceps_pending_state = "off"
+        self.biceps_pending_since = time.time()
+        self.biceps_high_active = False
+        self.biceps_current_direction = "plus"
+        self.biceps_next_direction = "plus"
+        self.triceps_pending_state = "off"
+        self.triceps_pending_since = time.time()
+        self.deltoid_pending_state = "off"
+        self.deltoid_pending_since = time.time()
+
+        self.is_calibrating = False
+        self.calibration_sequence = []
+        self.current_stage_index = -1
+        self.current_stage = None
+        self.current_measurement_index = 0
+        self.measurement_phase = "idle"
+        self.phase_start_time = None
+        self.capture_vectors = []
+
+        self.is_testing = False
+        self.test_sequence = []
+        self.current_test_index = -1
+        self.current_test_step = None
+        self.test_phase = "idle"
+        self.test_phase_start_time = None
+        self.test_samples = []
+        self.test_summary = []
+
+        self.speak_lock = threading.Lock()
+        self.controller = RobotController()
+        self.touch_count = 0
+        self.digital_touch = 0
+        self.current_touch = 0
+        self.current_avg = None
+        self.last_servo_send_time = 0.0
+        self.servo_send_interval_sec = 0.02
+        self.app_settings = load_app_settings()
+        self.apply_settings_to_globals()
+        self.key_bindings = {k: normalize_key_name(v) for k, v in self.app_settings["key_bindings"].items()}
+        self.pressed_keys = set()
+        self.graphics_enabled_var = tk.BooleanVar(value=bool(self.app_settings.get("graphics_enabled", True)))
+        self.sound_level_var = tk.DoubleVar(value=float(self.app_settings.get("sound_level", 0.8)))
+        self.keyboard_instruction_var = tk.StringVar(value="")
+
+        self.cap = None
+        self.camera_running = False
+        self.camera_thread = None
+        self.video_frame_lock = threading.Lock()
+        self.pose_landmarker = None
+        self.hand_landmarker = None
+        self.latest_video_bgr = None
+        self.video_preview_image = None
+        self.video_samples = deque()
+        self.video_status_var = tk.StringVar(value="Camera stopped")
+        self.video_r_var = tk.StringVar(value="0.0000")
+        self.video_theta_var = tk.StringVar(value="0.00")
+        self.video_z_var = tk.StringVar(value="0.0000")
+        self.video_squeeze_var = tk.StringVar(value="0.0")
+        self.video_twist_var = tk.StringVar(value="0.00")
+        self.video_arm_side_var = tk.StringVar(value=str(self.app_settings.get("video_arm_side", "right")))
+        self.video_grip_on_threshold_var = tk.DoubleVar(value=float(self.app_settings.get("video_grip_on_threshold", 70.0)))
+        self.video_grip_off_threshold_var = tk.DoubleVar(value=float(self.app_settings.get("video_grip_off_threshold", 40.0)))
+        self.video_grip_closed = False
+        self.video_twist_decision = INITIAL_DES_TWIST
+        self.video_target_warning_var = tk.StringVar(value="")
+
+        self.port_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="Not connected (inputs assumed zero)")
+        self.calib_var = tk.StringVar(value="Calibration idle")
+        self.model_var = tk.StringVar(value="Choose new or existing calibration")
+        self.sample_progress_var = tk.StringVar(value="Collected samples: 0 / 0")
+        self.countdown_var = tk.StringVar(value="")
+        self.contact_var = tk.StringVar(value="NO CONTACT")
+        self.control_var = tk.StringVar(value="Mode: ANGLE | Waiting")
+        self.servo_var = tk.StringVar(value="Servo cmd: not sent yet")
+        self.test_var = tk.StringVar(value="Test idle")
+        self.test_progress_var = tk.StringVar(value="")
+        self.app_mode_var = tk.StringVar(value=APP_MODE_EMG)
+        self.position_warning_var = tk.StringVar(value="")
+        self.position_target = None
+        self.position_target_source = None
+        self.last_keyboard_step_time = 0.0
+        self.last_position_step_time = 0.0
+
+        self.raw_vars = {m: tk.StringVar(value="0.000") for m in MUSCLES}
+        self.rms_vars = {m: tk.StringVar(value="0.000") for m in MUSCLES}
+        self.mav_vars = {m: tk.StringVar(value="0.000") for m in MUSCLES}
+        self.wl_vars = {m: tk.StringVar(value="0.000") for m in MUSCLES}
+        self.percent_vars = {m: tk.StringVar(value="0.0 %") for m in MUSCLES}
+        self.position_entry_vars = {
+            "angle": tk.StringVar(value=f"{INITIAL_DES_ANGLE:.2f}"),
+            "height": tk.StringVar(value=f"{INITIAL_DES_HEIGHT:.2f}"),
+            "distance": tk.StringVar(value=f"{INITIAL_DES_DISTANCE:.2f}"),
+            "twist": tk.StringVar(value=f"{INITIAL_DES_TWIST:.2f}"),
+            "gripper": tk.StringVar(value=f"{INITIAL_DES_GRIPPER:.2f}"),
+        }
+
+        self.progressbars = {}
+        self.dataset_labels = {}
+        self.stage_progress = None
+        self.test_progressbar = None
+
+        self.build_gui()
+        self.refresh_ports()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<KeyPress>", self.handle_key_press)
+        self.root.bind("<KeyRelease>", self.handle_key_release)
+        self.root.bind("<Return>", self.handle_enter_key)
+        self.root.after(UI_REFRESH_MS, self.update_ui_loop)
+
+    def empty_full_arm_calibration(self):
+        return {
+            "hand": {},
+            "biceps": {},
+            "triceps": {},
+            "chest": {},
+            "deltoid": {},
+        }
+
+    def empty_body_action_calibration(self):
+        return {action: [] for action in BODY_ACTION_CLASSES}
+
+    def is_axis_select_emg_mode(self):
+        return False
+
+    def is_full_arm_emg_mode(self):
+        return self.app_mode_var.get() == APP_MODE_FULL_ARM_EMG
+
+    def get_full_arm_feature_vector(self, muscle):
+        return get_model_input_vector(self.features, muscle)
+
+    def vector_distance(self, a, b):
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        if a.shape != b.shape:
+            return float("inf")
+        scale = np.maximum(np.maximum(np.abs(a), np.abs(b)), 1.0)
+        return float(np.linalg.norm((a - b) / scale))
+
+    def nearest_full_arm_state(self, muscle, possible_states):
+        cal = self.full_arm_calibration.get(muscle, {})
+        available = [st for st in possible_states if st in cal]
+        if not available:
+            return None, None, {}
+        x = self.get_full_arm_feature_vector(muscle)
+        dists = {st: self.vector_distance(x, cal[st]) for st in available}
+        best = min(dists, key=dists.get)
+        return best, dists[best], dists
+
+    def full_arm_feature_level(self, muscle, vector=None):
+        """Return one scalar magnitude for threshold-based classification.
+
+        RMS, MAV, and WL are kept as the signal-processing features, but the
+        chest classifier needs ordered signal levels.  The vector norm gives a
+        single magnitude while still using all three features.
+        """
+        if vector is None:
+            vector = self.get_full_arm_feature_vector(muscle)
+        vector = np.asarray(vector, dtype=float)
+        return float(np.linalg.norm(vector))
+
+    def choose_off_or_active_by_closeness(self, muscle, off_state, active_states):
+        """Choose an off/rest state or one of the active states by calibrated distance.
+
+        The rest state wins whenever it is the closest calibrated state.  This
+        prevents low/rest-like signals from accidentally becoming an active
+        command.  If the current vector is not closest to rest, only then do we
+        choose between the active cases by closeness.
+        """
+        cal = self.full_arm_calibration.get(muscle, {})
+        needed = [off_state] + list(active_states)
+        if not all(st in cal for st in needed):
+            return None
+
+        current_vector = self.get_full_arm_feature_vector(muscle)
+        dists = {st: self.vector_distance(current_vector, cal[st]) for st in needed}
+        best_any = min(dists, key=dists.get)
+        if best_any == off_state:
+            return off_state
+
+        return min(active_states, key=lambda st: dists[st])
+
+    def confirm_time_state(self, muscle, candidate, pending_attr, since_attr, rest_states, rest_time, active_time):
+        now = time.time()
+        pending = getattr(self, pending_attr)
+        if candidate != pending:
+            setattr(self, pending_attr, candidate)
+            setattr(self, since_attr, now)
+            return self.full_arm_states.get(muscle)
+
+        required_time = rest_time if candidate in rest_states else active_time
+        if (now - getattr(self, since_attr)) >= required_time:
+            self.full_arm_states[muscle] = candidate
+
+        return self.full_arm_states.get(muscle)
+
+    def get_body_base_feature_vector(self):
+        """Return the instantaneous body feature vector without hand.
+
+        The body classifier uses biceps, triceps, deltoid, and chest together.
+        Hand is intentionally excluded so the gripper can open/close at any
+        time without changing the body-action decision.
+        """
+        base = []
+        energies = []
+        for muscle in BODY_CHANNELS:
+            feats = self.features.get(muscle, {"rms": 0.0, "mav": 0.0, "wl": 0.0})
+            rms = float(feats.get("rms", 0.0))
+            mav = float(feats.get("mav", 0.0))
+            wl = float(feats.get("wl", 0.0))
+            base.extend([rms, mav, wl])
+            energies.append(max(0.0, rms) + max(0.0, mav) + max(0.0, wl))
+
+        total_energy = sum(energies) + 1e-9
+        base.extend([e / total_energy for e in energies])
+        return np.asarray(base, dtype=float)
+
+    def update_body_feature_history(self):
+        self.body_feature_history.append(self.get_body_base_feature_vector())
+
+    def get_body_action_feature_vector(self):
+        """Return the feature vector used by the body-action classifier.
+
+        It contains absolute RMS/MAV/WL body features, relative channel energy,
+        short-term slope, and short-term variance. This mirrors the MATLAB
+        prototype-classifier analysis but is suitable for real-time use.
+        """
+        base = self.get_body_base_feature_vector()
+        if len(self.body_feature_history) == 0:
+            history = np.vstack([base])
+        else:
+            history = np.vstack(list(self.body_feature_history))
+            if history.shape[1] != base.shape[0]:
+                history = np.vstack([base])
+
+        if history.shape[0] >= 2:
+            # update_body_feature_history() usually appends the current base before classification,
+            # so use the previous window for the slope when available.
+            prev = history[-2]
+        else:
+            prev = history[-1] if history.size else base
+        slope = base - prev
+        var = np.var(history, axis=0) if history.shape[0] >= 2 else np.zeros_like(base)
+        return np.concatenate([base, slope, var]).astype(float)
+
+    def train_body_action_model(self):
+        """Train normalized prototype distributions for calibrated actions."""
+        samples = []
+        labels = []
+        for action in BODY_ACTION_CLASSES:
+            for row in self.body_action_calibration.get(action, []):
+                try:
+                    x = np.asarray(row, dtype=float)
+                except Exception:
+                    continue
+                if x.size == 0 or not np.all(np.isfinite(x)):
+                    continue
+                samples.append(x)
+                labels.append(action)
+
+        if not samples:
+            self.body_action_model = None
+            return None
+
+        # Keep only samples with the most common dimensionality.
+        dims = [x.size for x in samples]
+        dim = max(set(dims), key=dims.count)
+        good = [(x, y) for x, y in zip(samples, labels) if x.size == dim]
+        if not good:
+            self.body_action_model = None
+            return None
+
+        X = np.vstack([x for x, _ in good])
+        y = [label for _, label in good]
+        global_mu = np.mean(X, axis=0)
+        global_sigma = np.std(X, axis=0)
+        global_sigma[global_sigma < 1e-9] = 1.0
+        Xn = (X - global_mu) / global_sigma
+
+        classes = []
+        class_mu = {}
+        class_sigma = {}
+        class_counts = {}
+        for action in BODY_ACTION_CLASSES:
+            idxs = [i for i, label in enumerate(y) if label == action]
+            if not idxs:
+                continue
+            Xa = Xn[idxs, :]
+            classes.append(action)
+            class_mu[action] = np.mean(Xa, axis=0).tolist()
+            s = np.std(Xa, axis=0)
+            s[s < BODY_CLASSIFIER_MIN_STD] = BODY_CLASSIFIER_MIN_STD
+            class_sigma[action] = s.tolist()
+            class_counts[action] = int(len(idxs))
+
+        if not classes:
+            self.body_action_model = None
+            return None
+
+        self.body_action_model = {
+            "classes": classes,
+            "global_mu": global_mu.tolist(),
+            "global_sigma": global_sigma.tolist(),
+            "class_mu": class_mu,
+            "class_sigma": class_sigma,
+            "class_counts": class_counts,
+        }
+        return self.body_action_model
+
+    def predict_body_action_raw(self, excluded_actions=None):
+        """Return raw action, confidence margin, and action-class distances.
+
+        excluded_actions lets the arm-down detector remove HEIGHT_DOWN from
+        the normal body classifier when arm-down was not detected by the
+        separate deltoid-zero rule.
+        """
+        excluded_actions = set(excluded_actions or [])
+        model = self.body_action_model
+        if not model:
+            self.body_last_distances = {}
+            self.body_last_confidence = 0.0
+            return "UNKNOWN", 0.0, {}
+
+        x = self.get_body_action_feature_vector()
+        mu0 = np.asarray(model.get("global_mu", []), dtype=float)
+        sg0 = np.asarray(model.get("global_sigma", []), dtype=float)
+        if x.size != mu0.size or x.size != sg0.size:
+            self.body_last_distances = {}
+            self.body_last_confidence = 0.0
+            return "UNKNOWN", 0.0, {}
+
+        sg0 = np.where(np.abs(sg0) < 1e-9, 1.0, sg0)
+        z = (x - mu0) / sg0
+
+        distances = {}
+        for action in model.get("classes", []):
+            if action in excluded_actions:
+                continue
+            mu = np.asarray(model.get("class_mu", {}).get(action, []), dtype=float)
+            sg = np.asarray(model.get("class_sigma", {}).get(action, []), dtype=float)
+            if z.size != mu.size or z.size != sg.size:
+                continue
+            sg = np.where(np.abs(sg) < BODY_CLASSIFIER_MIN_STD, BODY_CLASSIFIER_MIN_STD, sg)
+            distances[action] = float(np.sqrt(np.sum(((z - mu) / sg) ** 2)))
+
+        if not distances:
+            self.body_last_distances = {}
+            self.body_last_confidence = 0.0
+            return "UNKNOWN", 0.0, {}
+
+        ordered = sorted(distances.items(), key=lambda kv: kv[1])
+        best_action, best_dist = ordered[0]
+        if len(ordered) >= 2:
+            confidence = ordered[1][1] - best_dist
+        else:
+            confidence = 0.0
+
+        self.body_last_distances = distances
+        self.body_last_confidence = confidence
+
+        if len(ordered) >= 2 and confidence < BODY_CLASSIFIER_MIN_MARGIN:
+            return "UNKNOWN", confidence, distances
+        return best_action, confidence, distances
+
+    def update_deltoid_zero_feature_history(self, now=None):
+        """Store whether the current deltoid RMS/MAV/WL measurement is zero.
+
+        A history entry is True when at least one of the three deltoid features
+        is zero. This implements the requested rule:
+        RMS == 0 OR MAV == 0 OR WL == 0.
+        """
+        if now is None:
+            now = time.time()
+
+        feats = self.features.get("deltoid", {"rms": 0.0, "mav": 0.0, "wl": 0.0})
+        zero_feature = (
+            float(feats.get("rms", 0.0)) <= DELTOID_ZERO_EPS or
+            float(feats.get("mav", 0.0)) <= DELTOID_ZERO_EPS or
+            float(feats.get("wl", 0.0)) <= DELTOID_ZERO_EPS
+        )
+
+        self.deltoid_zero_feature_history.append((now, bool(zero_feature)))
+        while (
+            self.deltoid_zero_feature_history and
+            (now - self.deltoid_zero_feature_history[0][0]) > DELTOID_ZERO_ARM_DOWN_WINDOW_SEC
+        ):
+            self.deltoid_zero_feature_history.popleft()
+
+    def deltoid_zero_arm_down_detected(self):
+        """Return True when the last-second deltoid-zero ratio means arm down."""
+        if not self.deltoid_zero_feature_history:
+            return False
+        total = len(self.deltoid_zero_feature_history)
+        zero_count = sum(1 for _, is_zero in self.deltoid_zero_feature_history if is_zero)
+        return (zero_count / max(1, total)) > DELTOID_ZERO_ARM_DOWN_RATIO
+
+    def classify_body_action(self):
+        """Classify cumulative body action using calibrated action prototypes."""
+        excluded_actions = set()
+
+        if USE_DELTOID_ZERO_ARM_DOWN_OVERRIDE:
+            if self.deltoid_zero_arm_down_detected():
+                raw_action = BODY_ACTION_HEIGHT_DOWN
+                self.body_last_distances = {"DELTOID_ZERO_ARM_DOWN": 0.0}
+                self.body_last_confidence = 999.0
+            else:
+                # If the separate detector says this is not arm-down, then it
+                # is not allowed to become arm-down through body prototype
+                # closeness. The classifier can still choose rest, arm close,
+                # arm extend, height up, or chest active normally.
+                excluded_actions.add(BODY_ACTION_HEIGHT_DOWN)
+                raw_action, _, _ = self.predict_body_action_raw(excluded_actions=excluded_actions)
+        else:
+            raw_action, _, _ = self.predict_body_action_raw()
+
+        if raw_action == "UNKNOWN":
+            return self.body_current_action
+
+        if raw_action == self.body_pending_action:
+            self.body_pending_count += 1
+        else:
+            self.body_pending_action = raw_action
+            self.body_pending_count = 1
+
+        if self.body_pending_count >= BODY_CONFIRM_SAMPLES:
+            self.body_current_action = self.body_pending_action
+
+        return self.body_current_action
+
+    def body_action_to_full_arm_states(self, action):
+        states = {
+            "biceps": "off",
+            "triceps": "off",
+            "deltoid": "off",
+            "chest": "off",
+        }
+
+        if action == BODY_ACTION_ARM_CLOSE:
+            states["biceps"] = "plus"
+        elif action == BODY_ACTION_ARM_EXTEND:
+            states["triceps"] = "minus"
+        elif action == BODY_ACTION_HEIGHT_UP:
+            states["deltoid"] = "up"
+        elif action == BODY_ACTION_HEIGHT_DOWN:
+            states["deltoid"] = "down"
+        elif action == BODY_ACTION_CHEST_ACTIVE:
+            # A confirmed chest activation starts/continues rotation.  The
+            # direction changes only when the previous chest activation was
+            # released for CHEST_ROTATION_RELEASE_CONFIRM_SEC, so short false
+            # OFF spikes cannot arm the opposite direction.
+            self.chest_release_candidate_since = None
+            if not self.chest_high_active:
+                self.chest_high_active = True
+                self.chest_current_direction = self.chest_next_direction
+                self.chest_next_direction = "minus" if self.chest_current_direction == "plus" else "plus"
+            states["chest"] = self.chest_current_direction
+        else:
+            # Stop the rotation command immediately, but do not mark chest as
+            # truly released until it has stayed inactive for a full second.
+            # This prevents a brief deactivation spike followed by activation
+            # from flipping the rotation direction.
+            if self.chest_high_active:
+                now = time.time()
+                if self.chest_release_candidate_since is None:
+                    self.chest_release_candidate_since = now
+                elif (now - self.chest_release_candidate_since) >= CHEST_ROTATION_RELEASE_CONFIRM_SEC:
+                    self.chest_high_active = False
+                    self.chest_release_candidate_since = None
+            else:
+                self.chest_release_candidate_since = None
+
+        return states
+
+    def classify_hand_direct_open_closed(self):
+        """Full-Arm hand state from the old mode-switch percentage model.
+
+        The hand percentage is now calculated from the same calibrated
+        regression path as the mode-switch code. The result is still mapped
+        to the existing Full-Arm hand states, so the control outcome is
+        unchanged: high percentage closes the gripper, low percentage opens
+        it, and the middle range holds the previous state.
+        """
+        prev_hand = self.full_arm_states.get("hand", "open")
+        hand_pct = self.predicted_percentages.get("hand", 0.0)
+
+        if self.models.get("hand") is None:
+            candidate = prev_hand
+        elif hand_pct >= MODE_SWITCH_THRESHOLD:
+            candidate = "closed"
+        elif hand_pct <= MODE_RELEASE_THRESHOLD:
+            candidate = "open"
+        else:
+            candidate = prev_hand
+
+        return self.confirm_time_state(
+            "hand", candidate,
+            "hand_pending_state", "hand_pending_since",
+            rest_states={"open"},
+            rest_time=HAND_OPEN_CONFIRM_SEC,
+            active_time=HAND_CLOSED_CONFIRM_SEC,
+        ) or prev_hand
+
+    def classify_biceps_threshold(self):
+        """Threshold-based biceps control for Full-Arm EMG Mode.
+
+        This uses the same style as the previous Axis Select code: the
+        calibrated regression percentage is compared to PLUS_THRESHOLD.
+        High biceps means the biceps state is active. The control layer maps
+        this to -distance in the current reversed robot-operation mode.
+        """
+        pct = self.predicted_percentages.get("biceps", 0.0)
+        candidate = "plus" if pct > PLUS_THRESHOLD else "off"
+        return self.confirm_time_state(
+            "biceps", candidate,
+            "biceps_pending_state", "biceps_pending_since",
+            rest_states={"off"},
+            rest_time=BICEPS_RELAX_CONFIRM_SEC,
+            active_time=BICEPS_ACTIVE_CONFIRM_SEC,
+        ) or "off"
+
+    def classify_triceps_threshold(self):
+        """Threshold-based triceps control for Full-Arm EMG Mode.
+
+        High triceps means the triceps state is active. The control layer maps
+        this to +distance in the current reversed robot-operation mode. It is
+        intentionally independent from biceps calibration and uses the triceps
+        regression percentage with MINUS_THRESHOLD.
+        """
+        pct = self.predicted_percentages.get("triceps", 0.0)
+        candidate = "minus" if pct > MINUS_THRESHOLD else "off"
+        return self.confirm_time_state(
+            "triceps", candidate,
+            "triceps_pending_state", "triceps_pending_since",
+            rest_states={"off"},
+            rest_time=BICEPS_RELAX_CONFIRM_SEC,
+            active_time=BICEPS_ACTIVE_CONFIRM_SEC,
+        ) or "off"
+
+    def classify_chest_toggle_high_low(self):
+        """Chest control using the same percentage-threshold style as hand.
+
+        Chest is now calibrated through the same WL-only regression percentage
+        path as hand. High chest percentage enters the active state; low chest
+        percentage releases to off; the middle range holds the previous state.
+
+        The control result is still the existing chest behavior: while active,
+        angle moves in the stored direction, and each new off-to-active chest
+        activation alternates the direction between +angle and -angle.
+        """
+        prev_candidate = "high" if self.chest_high_active else "off"
+        chest_pct = self.predicted_percentages.get("chest", 0.0)
+
+        if self.models.get("chest") is None:
+            candidate = prev_candidate
+        elif chest_pct >= MODE_SWITCH_THRESHOLD:
+            candidate = "high"
+        elif chest_pct <= MODE_RELEASE_THRESHOLD:
+            candidate = "off"
+        else:
+            candidate = prev_candidate
+
+        now = time.time()
+        if candidate != self.chest_pending_state:
+            self.chest_pending_state = candidate
+            self.chest_pending_since = now
+            return self.chest_current_direction if self.chest_high_active else "off"
+
+        required_time = CHEST_HIGH_CONFIRM_SEC if candidate == "high" else CHEST_LOW_CONFIRM_SEC
+        if (now - self.chest_pending_since) < required_time:
+            return self.chest_current_direction if self.chest_high_active else "off"
+
+        if candidate == "high":
+            if not self.chest_high_active:
+                self.chest_high_active = True
+                self.chest_current_direction = self.chest_next_direction
+                self.chest_next_direction = "minus" if self.chest_current_direction == "plus" else "plus"
+            self.full_arm_states["chest"] = self.chest_current_direction
+        else:
+            self.chest_high_active = False
+            self.full_arm_states["chest"] = "off"
+
+        return self.full_arm_states.get("chest", "off")
+
+    def classify_deltoid_with_time_closeness(self):
+        """Classify deltoid by pure calibrated closeness: down / middle / up.
+
+        Full-Arm deltoid calibration stores three states:
+        - `down` : arm down, decreases height;
+        - `off`  : middle / relaxed arm position, no height movement;
+        - `up`   : arm up, increases height.
+
+        No zero-value condition is used. The current RMS/MAV/WL feature vector
+        is compared against all three calibrated vectors, and the nearest one
+        becomes the candidate state. Therefore, if the current input is closer
+        to the calibrated down data than to middle or up, the arm goes down.
+        Time confirmation is still used to prevent flicker.
+        """
+        cal = self.full_arm_calibration.get("deltoid", {})
+        needed = ["down", "off", "up"]
+        if not all(st in cal for st in needed):
+            return self.hysteretic_nearest_state("deltoid", needed) or "off"
+
+        current_vector = self.get_full_arm_feature_vector("deltoid")
+        dists = {st: self.vector_distance(current_vector, cal[st]) for st in needed}
+        candidate = min(dists, key=dists.get)
+
+        return self.confirm_time_state(
+            "deltoid", candidate,
+            "deltoid_pending_state", "deltoid_pending_since",
+            rest_states={"off"},
+            rest_time=DELTOID_RELAX_CONFIRM_SEC,
+            active_time=DELTOID_ACTIVE_CONFIRM_SEC,
+        ) or "off"
+
+    def hysteretic_nearest_state(self, muscle, possible_states, hold_margin=0.12):
+        previous = self.full_arm_states.get(muscle)
+        best, best_dist, dists = self.nearest_full_arm_state(muscle, possible_states)
+        if best is None:
+            return previous
+        if previous in dists and previous != best:
+            # Keep the previous state unless the new class is clearly closer.
+            if best_dist > dists[previous] * (1.0 - hold_margin):
+                return previous
+        self.full_arm_states[muscle] = best
+        return best
+
+    def classify_full_arm_inputs(self):
+        states = {}
+
+        hand_state = self.classify_hand_direct_open_closed()
+        body_action = self.classify_body_action()
+        body_states = self.body_action_to_full_arm_states(body_action)
+
+        states["hand"] = hand_state or "open"
+        states.update(body_states)
+
+        for muscle, state in states.items():
+            self.full_arm_states[muscle] = state
+        self.full_arm_states["body_action"] = body_action
+        return states
+
+    def full_arm_calibration_ready(self):
+        if self.models.get("hand") is None:
+            return False
+        if self.body_action_model is None:
+            self.train_body_action_model()
+        if self.body_action_model is None:
+            return False
+        trained = set(self.body_action_model.get("classes", []))
+        return all(action in trained for action in BODY_ACTION_CLASSES)
+
+    def full_arm_state_display_percent(self, muscle, state):
+        """Map discrete Full-Arm EMG states to visible 0-100 bar values.
+
+        Full-Arm mode does not use the regression models for biceps, chest,
+        and deltoid, so their old predicted percentages stay at 0.  This
+        display-only mapping makes the GUI bars reflect the active full-arm
+        classification without changing the control logic.
+        """
+        if muscle == "hand":
+            return 100.0 if state == "closed" else 0.0
+        if muscle in ("biceps", "triceps", "chest"):
+            # Two-level threshold/toggle channels: active directions are shown as high.
+            if state in ("plus", "minus"):
+                return 100.0
+            return 0.0
+        if muscle == "deltoid":
+            if state == "up":
+                return 100.0
+            if state == "off":
+                return 50.0
+            return 0.0
+        return 0.0
+
+    def update_full_arm_bar_display(self, states):
+        labels = {
+            "open": "open",
+            "closed": "closed",
+            "off": "relax",
+            "plus": "+",
+            "minus": "-",
+            "down": "down",
+            "up": "up",
+        }
+        for muscle in MUSCLES:
+            state = states.get(muscle, self.full_arm_states.get(muscle, "off"))
+            if muscle == "hand":
+                y = float(self.predicted_percentages.get(muscle, 0.0))
+            else:
+                y = self.full_arm_state_display_percent(muscle, state)
+                self.predicted_percentages[muscle] = y
+            self.percent_vars[muscle].set(f"{labels.get(state, state)} ({y:.1f} %)")
+            self.progressbars[muscle]["value"] = y
+
+    def apply_settings_to_globals(self):
+        global MODE_SWITCH_THRESHOLD, MODE_RELEASE_THRESHOLD, PLUS_THRESHOLD, MINUS_THRESHOLD
+        limits = self.app_settings.get("activation_limits", {})
+        MODE_SWITCH_THRESHOLD = float(limits.get("mode_switch_threshold", MODE_SWITCH_THRESHOLD))
+        MODE_RELEASE_THRESHOLD = float(limits.get("mode_release_threshold", MODE_RELEASE_THRESHOLD))
+        PLUS_THRESHOLD = float(limits.get("plus_threshold", PLUS_THRESHOLD))
+        MINUS_THRESHOLD = float(limits.get("minus_threshold", MINUS_THRESHOLD))
+
+    def persist_settings(self):
+        self.app_settings["sound_level"] = float(self.sound_level_var.get())
+        self.app_settings["graphics_enabled"] = bool(self.graphics_enabled_var.get())
+        self.app_settings["video_arm_side"] = self.video_arm_side_var.get().strip().lower()
+        self.app_settings["video_grip_on_threshold"] = float(self.video_grip_on_threshold_var.get())
+        self.app_settings["video_grip_off_threshold"] = float(self.video_grip_off_threshold_var.get())
+        self.app_settings["key_bindings"] = self.key_bindings.copy()
+        self.apply_settings_to_globals()
+        save_app_settings(self.app_settings)
+
+    def speak_async(self, text):
+        if not ENABLE_VOICE or not TTS_AVAILABLE:
+            return
+        threading.Thread(target=self._speak_blocking, args=(text,), daemon=True).start()
+
+    def _speak_blocking(self, text):
+        with self.speak_lock:
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty("rate", 170)
+                engine.setProperty("volume", clamp(float(self.sound_level_var.get()), 0.0, 1.0))
+                engine.say(text)
+                engine.runAndWait()
+            except Exception:
+                pass
+
+    def build_gui(self):
+        self.main_canvas = tk.Canvas(self.root, highlightthickness=0)
+        self.main_scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.main_canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.main_canvas)
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+        )
+        self.main_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.main_canvas.configure(yscrollcommand=self.main_scrollbar.set)
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        self.main_scrollbar.pack(side="right", fill="y")
+        self.main_canvas.bind_all("<MouseWheel>", self.on_mousewheel)
+
+        top = ttk.Frame(self.scrollable_frame, padding=10)
+        top.pack(fill="x")
+
+        left_top = ttk.Frame(top)
+        left_top.pack(side="left", fill="x", expand=True)
+
+        right_top = ttk.Frame(top)
+        right_top.pack(side="right", anchor="ne")
+
+        ttk.Label(left_top, text="Serial Port:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.port_combo = ttk.Combobox(left_top, textvariable=self.port_var, state="readonly", width=18)
+        self.port_combo.grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(left_top, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(left_top, text="Connect", command=self.connect_serial).grid(row=0, column=3, padx=5, pady=5)
+        ttk.Button(left_top, text="Disconnect", command=self.disconnect_serial).grid(row=0, column=4, padx=5, pady=5)
+        ttk.Label(left_top, text="Control Mode:").grid(row=0, column=5, padx=(20, 5), pady=5, sticky="e")
+        self.app_mode_combo = ttk.Combobox(left_top, textvariable=self.app_mode_var, values=APP_MODES, state="readonly", width=18)
+        self.app_mode_combo.grid(row=0, column=6, padx=5, pady=5, sticky="w")
+        self.app_mode_combo.bind("<<ComboboxSelected>>", self.on_app_mode_changed)
+        self.settings_btn = ttk.Button(left_top, text="⚙", width=3, command=self.open_settings_dialog)
+        self.settings_btn.grid(row=0, column=7, padx=(2, 5), pady=5, sticky="w")
+
+        ttk.Label(left_top, textvariable=self.status_var, foreground="blue").grid(row=1, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+        ttk.Label(left_top, textvariable=self.calib_var, foreground="darkgreen", font=("Arial", 10, "bold")).grid(row=2, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+        ttk.Label(left_top, textvariable=self.sample_progress_var, foreground="purple").grid(row=3, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+        ttk.Label(left_top, textvariable=self.countdown_var, foreground="red").grid(row=4, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+        ttk.Label(left_top, textvariable=self.contact_var, foreground="red", font=("Arial", 11, "bold")).grid(row=5, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+        ttk.Label(left_top, textvariable=self.model_var, foreground="brown").grid(row=6, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+        ttk.Label(left_top, textvariable=self.control_var, foreground="darkorange", font=("Arial", 10, "bold")).grid(row=7, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+        ttk.Label(left_top, textvariable=self.servo_var, foreground="black").grid(row=8, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+        ttk.Label(left_top, textvariable=self.test_var, foreground="darkred", font=("Arial", 10, "bold")).grid(row=9, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+        ttk.Label(left_top, textvariable=self.test_progress_var, foreground="darkmagenta").grid(row=10, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+
+        try:
+            img = Image.open(LOGO_FILE)
+            img.thumbnail((180, 180))
+            self.logo_img = ImageTk.PhotoImage(img)
+            self.logo_label = ttk.Label(right_top, image=self.logo_img)
+            self.logo_label.pack(anchor="ne", padx=10, pady=5)
+        except Exception:
+            self.logo_label = ttk.Label(right_top, text="Logo not found")
+            self.logo_label.pack(anchor="ne", padx=10, pady=5)
+
+        self.graphics_parent = right_top
+        self.graphics_frame = ttk.LabelFrame(self.graphics_parent, text="Robot Visualization", padding=8)
+        self.graphics_frame.pack(anchor="ne", padx=10, pady=(5, 0))
+        self.robot_canvas = tk.Canvas(self.graphics_frame, width=260, height=170, bg="white", highlightthickness=1, highlightbackground="#cccccc")
+        self.robot_canvas.pack(anchor="ne", padx=5, pady=(0, 5))
+        self.gripper_canvas = tk.Canvas(self.graphics_frame, width=260, height=105, bg="white", highlightthickness=1, highlightbackground="#cccccc")
+        self.gripper_canvas.pack(anchor="ne", padx=5, pady=(0, 0))
+
+        controls = ttk.Frame(self.scrollable_frame, padding=10)
+        controls.pack(fill="x")
+
+        self.new_calib_btn = ttk.Button(controls, text="New Calibration", command=self.start_calibration)
+        self.new_calib_btn.pack(side="left", padx=5)
+        self.use_existing_btn = ttk.Button(controls, text="Use Existing Calibration", command=self.use_existing_calibration)
+        self.use_existing_btn.pack(side="left", padx=5)
+        ttk.Button(controls, text="Reset Controller State", command=self.reset_controller).pack(side="left", padx=5)
+        self.start_test_btn = ttk.Button(controls, text="Start Test Mode", command=self.start_test_mode)
+        self.start_test_btn.pack(side="left", padx=5)
+        self.stop_test_btn = ttk.Button(controls, text="Stop Test Mode", command=self.stop_test_mode)
+        self.stop_test_btn.pack(side="left", padx=5)
+
+        muscle_controls = ttk.LabelFrame(self.scrollable_frame, text="Calibration", padding=10)
+        muscle_controls.pack(fill="x", padx=10, pady=5)
+
+        self.calib_hand_btn = ttk.Button(muscle_controls, text="Calibrate Hand", command=lambda: self.start_single_muscle_calibration("hand"))
+        self.calib_hand_btn.pack(side="left", padx=5)
+        self.calib_arm_btn = ttk.Button(muscle_controls, text="Calibrate Arm (Biceps/Triceps)", command=self.start_arm_pair_calibration)
+        self.calib_arm_btn.pack(side="left", padx=5)
+        self.calib_biceps_btn = ttk.Button(muscle_controls, text="Calibrate Biceps", command=lambda: self.start_single_muscle_calibration("biceps"))
+        self.calib_triceps_btn = ttk.Button(muscle_controls, text="Calibrate Triceps", command=lambda: self.start_single_muscle_calibration("triceps"))
+        self.calib_deltoid_btn = ttk.Button(muscle_controls, text="Calibrate Deltoid", command=lambda: self.start_single_muscle_calibration("deltoid"))
+        self.calib_chest_btn = ttk.Button(muscle_controls, text="Calibrate Chest", command=lambda: self.start_single_muscle_calibration("chest"))
+        self.calib_chest_btn.pack(side="left", padx=5)
+
+        progress_frame = ttk.Frame(self.scrollable_frame, padding=(10, 0, 10, 10))
+        progress_frame.pack(fill="x")
+        ttk.Label(progress_frame, text="Calibration Progress:").pack(anchor="w")
+        self.stage_progress = ttk.Progressbar(progress_frame, orient="horizontal", length=600, mode="determinate", maximum=100)
+        self.stage_progress.pack(fill="x", pady=5)
+
+        ttk.Label(progress_frame, text="Test Progress:").pack(anchor="w")
+        self.test_progressbar = ttk.Progressbar(progress_frame, orient="horizontal", length=600, mode="determinate", maximum=100)
+        self.test_progressbar.pack(fill="x", pady=5)
+
+        self.live_content_frame = ttk.Frame(self.scrollable_frame, padding=10)
+        self.live_content_frame.pack(fill="both", expand=True)
+
+        self.emg_table_frame = ttk.Frame(self.live_content_frame)
+        self.keyboard_instruction_frame = ttk.LabelFrame(self.live_content_frame, text="Keyboard Control Instructions", padding=18)
+        self.position_control_frame = ttk.LabelFrame(self.live_content_frame, text="Position Control", padding=18)
+        self.video_control_frame = ttk.LabelFrame(self.live_content_frame, text="Video Based Control", padding=12)
+
+        headers = ["Muscle", "Raw", "RMS", "MAV", "WL", "Predicted %", "Bar"]
+        for c, h in enumerate(headers):
+            ttk.Label(self.emg_table_frame, text=h, font=("Arial", 10, "bold")).grid(row=0, column=c, padx=8, pady=8)
+
+        self.muscle_name_labels = {}
+        for i, muscle in enumerate(MUSCLES, start=1):
+            name_lbl = ttk.Label(self.emg_table_frame, text=display_name_for_mode(muscle, self.app_mode_var.get()), font=("Arial", 10, "bold"))
+            name_lbl.grid(row=i, column=0, padx=8, pady=8, sticky="w")
+            self.muscle_name_labels[muscle] = name_lbl
+            ttk.Label(self.emg_table_frame, textvariable=self.raw_vars[muscle]).grid(row=i, column=1, padx=8, pady=8)
+            ttk.Label(self.emg_table_frame, textvariable=self.rms_vars[muscle]).grid(row=i, column=2, padx=8, pady=8)
+            ttk.Label(self.emg_table_frame, textvariable=self.mav_vars[muscle]).grid(row=i, column=3, padx=8, pady=8)
+            ttk.Label(self.emg_table_frame, textvariable=self.wl_vars[muscle]).grid(row=i, column=4, padx=8, pady=8)
+            ttk.Label(self.emg_table_frame, textvariable=self.percent_vars[muscle], font=("Arial", 10, "bold")).grid(row=i, column=5, padx=8, pady=8)
+            pb = ttk.Progressbar(self.emg_table_frame, orient="horizontal", length=260, mode="determinate", maximum=100)
+            pb.grid(row=i, column=6, padx=8, pady=8)
+            self.progressbars[muscle] = pb
+
+        self.update_keyboard_instruction_text()
+        ttk.Label(self.keyboard_instruction_frame, textvariable=self.keyboard_instruction_var, justify="left", font=("Arial", 14)).pack(anchor="w")
+        ttk.Label(self.keyboard_instruction_frame, text="Click anywhere inside this window if the keyboard does not respond.", foreground="gray").pack(anchor="w", pady=(12, 0))
+
+        position_grid = ttk.Frame(self.position_control_frame)
+        position_grid.pack(anchor="w")
+        position_rows = [("angle", "Angle (deg)"), ("height", "Height"), ("distance", "Distance"), ("twist", "Twist (deg)"), ("gripper", "Gripper")]
+        for r, (key, label) in enumerate(position_rows):
+            ttk.Label(position_grid, text=label + ":").grid(row=r, column=0, sticky="e", padx=5, pady=5)
+            ent = ttk.Entry(position_grid, textvariable=self.position_entry_vars[key], width=14)
+            ent.grid(row=r, column=1, sticky="w", padx=5, pady=5)
+            ent.bind("<Return>", lambda event: self.send_position_target())
+
+        self.position_send_btn = ttk.Button(position_grid, text="Send", command=self.send_position_target)
+        self.position_send_btn.grid(row=len(position_rows), column=0, columnspan=2, pady=(10, 5))
+        ttk.Label(self.position_control_frame, textvariable=self.position_warning_var, foreground="red", font=("Arial", 10, "bold")).pack(anchor="w", pady=(10, 0))
+        ttk.Label(self.position_control_frame, text="The target is approached gradually using ANGLE_STEP, HEIGHT_STEP, DIST_STEP, TWIST_STEP, and GRIPPER_STEP.", foreground="gray").pack(anchor="w", pady=(8, 0))
+
+
+        video_top = ttk.Frame(self.video_control_frame)
+        video_top.pack(fill="x", pady=(0, 8))
+        self.video_start_btn = ttk.Button(video_top, text="Start Camera", command=self.start_camera)
+        self.video_start_btn.pack(side="left", padx=5)
+        self.video_stop_btn = ttk.Button(video_top, text="Stop Camera", command=self.stop_camera)
+        self.video_stop_btn.pack(side="left", padx=5)
+        ttk.Label(video_top, textvariable=self.video_status_var, foreground="blue").pack(side="left", padx=12)
+        ttk.Label(video_top, textvariable=self.video_target_warning_var, foreground="red").pack(side="left", padx=12)
+
+        video_main = ttk.Frame(self.video_control_frame)
+        video_main.pack(fill="both", expand=True)
+        video_left = ttk.Frame(video_main)
+        video_left.pack(side="left", fill="both", expand=True)
+        video_right = ttk.LabelFrame(video_main, text="1 s averaged video input", padding=10)
+        video_right.pack(side="right", fill="y", padx=10)
+        self.video_label = ttk.Label(video_left, text="Camera preview will appear here")
+        self.video_label.pack(fill="both", expand=True)
+
+        vf = ("Arial", 12, "bold")
+        vv = ("Consolas", 12)
+        ttk.Label(video_right, text="r (cm)", font=vf).grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        ttk.Label(video_right, textvariable=self.video_r_var, font=vv).grid(row=0, column=1, sticky="e", padx=6, pady=5)
+        ttk.Label(video_right, text="theta (deg)", font=vf).grid(row=1, column=0, sticky="w", padx=6, pady=5)
+        ttk.Label(video_right, textvariable=self.video_theta_var, font=vv).grid(row=1, column=1, sticky="e", padx=6, pady=5)
+        ttk.Label(video_right, text="z (cm)", font=vf).grid(row=2, column=0, sticky="w", padx=6, pady=5)
+        ttk.Label(video_right, textvariable=self.video_z_var, font=vv).grid(row=2, column=1, sticky="e", padx=6, pady=5)
+        ttk.Label(video_right, text="squeeze", font=vf).grid(row=3, column=0, sticky="w", padx=6, pady=5)
+        ttk.Label(video_right, textvariable=self.video_squeeze_var, font=vv).grid(row=3, column=1, sticky="e", padx=6, pady=5)
+        ttk.Label(video_right, text="twist (deg)", font=vf).grid(row=4, column=0, sticky="w", padx=6, pady=5)
+        ttk.Label(video_right, textvariable=self.video_twist_var, font=vv).grid(row=4, column=1, sticky="e", padx=6, pady=5)
+        ttk.Label(video_right, text="Video target speed is capped at 4× the normal step sizes.", foreground="gray", wraplength=220, justify="left").grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(12, 0))
+
+        self.emg_table_frame.pack(fill="both", expand=True)
+
+        self.dataset_frame = ttk.LabelFrame(self.scrollable_frame, text="Calibration Status", padding=10)
+        self.dataset_frame.pack(fill="x", padx=10, pady=10)
+        for i, muscle in enumerate(MUSCLES):
+            lbl = ttk.Label(self.dataset_frame, text="")
+            lbl.grid(row=i, column=0, sticky="w", padx=5, pady=3)
+            self.dataset_labels[muscle] = lbl
+        self.update_dataset_labels()
+        self.on_app_mode_changed()
+        self.apply_graphics_visibility()
+
+
+    def update_keyboard_instruction_text(self):
+        b = self.key_bindings
+        self.keyboard_instruction_var.set(
+            f"{key_display_name(b['distance_plus'])} = + distance\n"
+            f"{key_display_name(b['distance_minus'])} = - distance\n"
+            f"{key_display_name(b['angle_minus'])} = - angle\n"
+            f"{key_display_name(b['angle_plus'])} = + angle\n"
+            f"{key_display_name(b['height_plus'])} = + height\n"
+            f"{key_display_name(b['height_minus'])} = - height\n"
+            f"{key_display_name(b['twist_minus'])} = - twist\n"
+            f"{key_display_name(b['twist_plus'])} = + twist\n"
+            f"{key_display_name(b['gripper_plus'])} = + gripper\n"
+            f"{key_display_name(b['gripper_minus'])} = - gripper"
+        )
+
+    def open_settings_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.geometry("520x520")
+        win.transient(self.root)
+
+        notebook = ttk.Notebook(win)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+        sound_tab = ttk.Frame(notebook, padding=12)
+        graphics_tab = ttk.Frame(notebook, padding=12)
+        keys_tab = ttk.Frame(notebook, padding=12)
+        advanced_tab = ttk.Frame(notebook, padding=12)
+        video_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(sound_tab, text="Sound")
+        notebook.add(graphics_tab, text="Graphics")
+        notebook.add(keys_tab, text="Key Binding")
+        notebook.add(advanced_tab, text="Advanced")
+        notebook.add(video_tab, text="Video")
+
+        ttk.Label(sound_tab, text="Narrator sound level").pack(anchor="w")
+        ttk.Scale(sound_tab, from_=0.0, to=1.0, variable=self.sound_level_var, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Label(sound_tab, text="0 = muted, 1 = maximum narrator volume").pack(anchor="w")
+
+        ttk.Checkbutton(graphics_tab, text="Show robot visualizations", variable=self.graphics_enabled_var).pack(anchor="w")
+
+        action_labels = {
+            "distance_plus": "+ distance",
+            "distance_minus": "- distance",
+            "angle_minus": "- angle",
+            "angle_plus": "+ angle",
+            "height_plus": "+ height",
+            "height_minus": "- height",
+            "twist_minus": "- twist",
+            "twist_plus": "+ twist",
+            "gripper_plus": "+ gripper",
+            "gripper_minus": "- gripper",
+        }
+        key_vars = {}
+        for r, action in enumerate(action_labels):
+            ttk.Label(keys_tab, text=action_labels[action] + ":").grid(row=r, column=0, sticky="e", padx=5, pady=4)
+            v = tk.StringVar(value=self.key_bindings.get(action, DEFAULT_KEY_BINDINGS[action]))
+            key_vars[action] = v
+            ttk.Entry(keys_tab, textvariable=v, width=16).grid(row=r, column=1, sticky="w", padx=5, pady=4)
+        ttk.Label(keys_tab, text="Examples: w, s, up, down, left, right, space, ctrl", foreground="gray").grid(row=len(action_labels), column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        limit_vars = {}
+        limit_labels = {
+            "mode_switch_threshold": "Mode switch threshold (%)",
+            "mode_release_threshold": "Mode release threshold (%)",
+            "plus_threshold": "Biceps / plus threshold (%)",
+            "minus_threshold": "Triceps / minus threshold (%)",
+        }
+        limits = self.app_settings.get("activation_limits", DEFAULT_APP_SETTINGS["activation_limits"].copy())
+        for r, key in enumerate(limit_labels):
+            ttk.Label(advanced_tab, text=limit_labels[key] + ":").grid(row=r, column=0, sticky="e", padx=5, pady=5)
+            v = tk.StringVar(value=str(limits.get(key, DEFAULT_APP_SETTINGS["activation_limits"][key])))
+            limit_vars[key] = v
+            ttk.Entry(advanced_tab, textvariable=v, width=12).grid(row=r, column=1, sticky="w", padx=5, pady=5)
+
+        ttk.Label(video_tab, text="Tracked arm:").grid(row=0, column=0, sticky="e", padx=5, pady=5)
+        ttk.Combobox(video_tab, textvariable=self.video_arm_side_var, values=["right", "left"], state="readonly", width=12).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(video_tab, text="Grip ON threshold (%):").grid(row=1, column=0, sticky="e", padx=5, pady=5)
+        ttk.Entry(video_tab, textvariable=self.video_grip_on_threshold_var, width=12).grid(row=1, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(video_tab, text="Grip OFF threshold (%):").grid(row=2, column=0, sticky="e", padx=5, pady=5)
+        ttk.Entry(video_tab, textvariable=self.video_grip_off_threshold_var, width=12).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(video_tab, text="Grip uses hysteresis: above ON closes, below OFF opens.", foreground="gray", wraplength=360, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 0))
+
+        button_row = ttk.Frame(win, padding=(10, 0, 10, 10))
+        button_row.pack(fill="x")
+
+        def save_and_close():
+            try:
+                for key, var in limit_vars.items():
+                    val = float(var.get())
+                    if not 0.0 <= val <= 100.0:
+                        raise ValueError(f"{limit_labels[key]} must be between 0 and 100.")
+                    self.app_settings.setdefault("activation_limits", {})[key] = val
+                grip_on = float(self.video_grip_on_threshold_var.get())
+                grip_off = float(self.video_grip_off_threshold_var.get())
+                if not (0.0 <= grip_off <= grip_on <= 100.0):
+                    raise ValueError("Video grip thresholds must satisfy 0 <= OFF <= ON <= 100.")
+                self.video_grip_on_threshold_var.set(grip_on)
+                self.video_grip_off_threshold_var.set(grip_off)
+                self.video_arm_side_var.set(self.video_arm_side_var.get().strip().lower())
+                self.key_bindings = {k: normalize_key_name(v.get()) for k, v in key_vars.items()}
+                self.update_keyboard_instruction_text()
+                self.persist_settings()
+                self.apply_graphics_visibility()
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Settings Error", str(e), parent=win)
+
+        ttk.Button(button_row, text="Save", command=save_and_close).pack(side="right", padx=5)
+        ttk.Button(button_row, text="Cancel", command=win.destroy).pack(side="right", padx=5)
+
+    def apply_graphics_visibility(self):
+        if bool(self.graphics_enabled_var.get()):
+            if not self.graphics_frame.winfo_ismapped():
+                self.graphics_frame.pack(anchor="ne", padx=10, pady=(5, 0))
+        else:
+            self.graphics_frame.pack_forget()
+
+    def on_mousewheel(self, event):
+        try:
+            self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except Exception:
+            pass
+
+
+    def update_full_arm_labels_and_calibration_buttons(self):
+        mode = self.app_mode_var.get()
+
+        # Update visible muscle names in the live table.
+        if hasattr(self, "muscle_name_labels"):
+            for muscle, lbl in self.muscle_name_labels.items():
+                lbl.config(text=display_name_for_mode(muscle, mode))
+
+        # There is now only one EMG mode: Full-Arm EMG Mode.
+        # Show the individual muscle calibration buttons and hide the old paired arm button.
+        if hasattr(self, "calib_biceps_btn") and hasattr(self, "calib_deltoid_btn") and hasattr(self, "calib_triceps_btn"):
+            self.calib_arm_btn.pack_forget()
+            if not self.calib_biceps_btn.winfo_ismapped():
+                self.calib_biceps_btn.pack(side="left", padx=5, before=self.calib_chest_btn)
+            if not self.calib_triceps_btn.winfo_ismapped():
+                self.calib_triceps_btn.pack(side="left", padx=5, before=self.calib_chest_btn)
+            if not self.calib_deltoid_btn.winfo_ismapped():
+                self.calib_deltoid_btn.pack(side="left", padx=5, before=self.calib_chest_btn)
+
+    def on_app_mode_changed(self, event=None):
+        mode = self.app_mode_var.get()
+        self.update_full_arm_labels_and_calibration_buttons()
+        if mode != APP_MODE_VIDEO and self.camera_running:
+            self.stop_camera()
+        for frame in (self.emg_table_frame, self.keyboard_instruction_frame, self.position_control_frame, self.video_control_frame):
+            frame.pack_forget()
+
+        if is_emg_app_mode(mode):
+            self.emg_table_frame.pack(fill="both", expand=True)
+            self.position_warning_var.set("")
+            self.dataset_frame.pack(fill="x", padx=10, pady=10)
+        elif mode == APP_MODE_KEYBOARD:
+            self.keyboard_instruction_frame.pack(fill="both", expand=True)
+            self.position_warning_var.set("")
+            self.dataset_frame.pack_forget()
+            self.root.focus_set()
+        elif mode == APP_MODE_POSITION:
+            self.position_control_frame.pack(fill="both", expand=True)
+            self.sync_position_entries_from_controller()
+            self.dataset_frame.pack_forget()
+        elif mode == APP_MODE_VIDEO:
+            self.video_control_frame.pack(fill="both", expand=True)
+            self.dataset_frame.pack_forget()
+        else:
+            self.dataset_frame.pack_forget()
+
+        emg_enabled = is_emg_app_mode(mode)
+        state = "normal" if emg_enabled else "disabled"
+        for btn in [self.new_calib_btn, self.use_existing_btn, self.start_test_btn, self.stop_test_btn,
+                    self.calib_hand_btn, self.calib_arm_btn, self.calib_biceps_btn, self.calib_triceps_btn, self.calib_deltoid_btn, self.calib_chest_btn]:
+            btn.config(state=state)
+
+        if not emg_enabled:
+            if self.is_calibrating:
+                self.is_calibrating = False
+                self.calib_var.set("Calibration stopped because EMG Control is not active")
+            if self.is_testing:
+                self.stop_test_mode()
+
+    def sync_position_entries_from_controller(self):
+        self.position_entry_vars["angle"].set(f"{self.controller.des_angle:.2f}")
+        self.position_entry_vars["height"].set(f"{self.controller.des_height:.2f}")
+        self.position_entry_vars["distance"].set(f"{self.controller.des_distance:.2f}")
+        self.position_entry_vars["twist"].set(f"{self.controller.servo_angles[4]:.2f}")
+        self.position_entry_vars["gripper"].set(f"{self.controller.des_gripper:.2f}")
+
+    def apply_contact_limit_to_target(self, target):
+        """Prevent any mode from further closing the gripper after contact is detected.
+
+        This matches the EMG mode behavior: opening is always allowed, but closing
+        past the current gripper command is blocked while the contact sensor is active.
+        """
+        if target is None:
+            return False
+        if self.touch_count and target.get("gripper", self.controller.des_gripper) > self.controller.des_gripper:
+            target["gripper"] = self.controller.des_gripper
+            return True
+        return False
+
+    def send_position_target(self):
+        try:
+            target = {
+                "angle": float(self.position_entry_vars["angle"].get()),
+                "height": float(self.position_entry_vars["height"].get()),
+                "distance": float(self.position_entry_vars["distance"].get()),
+                "twist": float(self.position_entry_vars["twist"].get()),
+                "gripper": float(self.position_entry_vars["gripper"].get()),
+            }
+        except ValueError:
+            self.position_target = None
+            self.position_warning_var.set("Warning: please enter numeric values only.")
+            return
+
+        contact_limited = self.apply_contact_limit_to_target(target)
+        target, was_limited, limit_msg = self.controller.project_target_to_reachable_pose(target)
+        contact_limited = self.apply_contact_limit_to_target(target) or contact_limited
+
+        self.position_target = target
+        self.position_target_source = "position"
+        if contact_limited:
+            self.position_warning_var.set("Target accepted, but contact is detected: gripper closing is limited.")
+        elif was_limited:
+            self.position_warning_var.set(limit_msg)
+        else:
+            self.position_warning_var.set("Target accepted. Moving slowly toward desired pose...")
+        self.root.focus_set()
+
+    def handle_key_press(self, event):
+        key = normalize_key_name(event.keysym)
+        self.pressed_keys.add(key)
+        if key in ("control_l", "control_r"):
+            self.pressed_keys.add("control_l")
+
+    def handle_key_release(self, event):
+        key = normalize_key_name(event.keysym)
+        self.pressed_keys.discard(key)
+        if key in ("control_l", "control_r"):
+            self.pressed_keys.discard("control_l")
+            self.pressed_keys.discard("control_r")
+
+    def handle_enter_key(self, event):
+        if self.app_mode_var.get() == APP_MODE_POSITION:
+            self.send_position_target()
+
+    def is_action_pressed(self, action):
+        key = normalize_key_name(self.key_bindings.get(action, DEFAULT_KEY_BINDINGS[action]))
+        if key == "control_l":
+            return "control_l" in self.pressed_keys or "control_r" in self.pressed_keys
+        return key in self.pressed_keys
+
+    def process_held_keyboard_controls(self, now):
+        if self.app_mode_var.get() != APP_MODE_KEYBOARD:
+            self.pressed_keys.clear()
+            return
+        if self.is_calibrating or self.is_testing or self.position_target is not None:
+            return
+        if (now - self.last_keyboard_step_time) < CONTROL_REPEAT_SEC:
+            return
+
+        changed = False
+
+        if self.is_action_pressed("distance_plus"):
+            self.controller.des_distance += DIST_STEP
+            changed = True
+        if self.is_action_pressed("distance_minus"):
+            self.controller.des_distance -= DIST_STEP
+            changed = True
+        if self.is_action_pressed("angle_minus"):
+            self.controller.des_angle -= ANGLE_STEP
+            changed = True
+        if self.is_action_pressed("angle_plus"):
+            self.controller.des_angle += ANGLE_STEP
+            changed = True
+        if self.is_action_pressed("height_plus"):
+            self.controller.des_height += HEIGHT_STEP
+            changed = True
+        if self.is_action_pressed("height_minus"):
+            self.controller.des_height -= HEIGHT_STEP
+            changed = True
+        if self.is_action_pressed("twist_minus"):
+            self.controller.servo_angles[4] -= TWIST_STEP
+            changed = True
+        if self.is_action_pressed("twist_plus"):
+            self.controller.servo_angles[4] += TWIST_STEP
+            changed = True
+        if self.is_action_pressed("gripper_plus"):
+            if self.touch_count < 1:
+                self.controller.des_gripper += GRIPPER_STEP
+                changed = True
+        if self.is_action_pressed("gripper_minus"):
+            self.controller.des_gripper -= GRIPPER_STEP
+            changed = True
+
+        if changed:
+            self.controller.des_angle = clamp(self.controller.des_angle, ANGLE_MIN, ANGLE_MAX)
+            self.controller.des_height = clamp(self.controller.des_height, HEIGHT_MIN, HEIGHT_MAX)
+            self.controller.des_distance = clamp(self.controller.des_distance, DIST_MIN, DIST_MAX)
+            self.controller.des_gripper = clamp(self.controller.des_gripper, GRIP_MIN, GRIP_MAX)
+            self.controller.servo_angles[4] = clamp(self.controller.servo_angles[4], TWIST_MIN, TWIST_MAX)
+            self.controller.run_ik_and_update_servos()
+            self.last_keyboard_step_time = now
+
+    def draw_robot_model(self):
+        self.draw_arm_model()
+        self.draw_gripper_model()
+
+    def draw_arm_model(self):
+        c = self.robot_canvas
+        c.delete("all")
+        w = int(c["width"])
+        h = int(c["height"])
+        cx, cy = w * 0.48, h * 0.68
+        scale = 4.2
+
+        yaw = math.radians(self.controller.des_angle)
+        r = max(0.0, self.controller.des_distance)
+        z = self.controller.des_height
+        wrist_r = max(0.0, r - GRIPPER_BASE_LENGTH)
+
+        base = (0.0, 0.0, 0.0)
+        shoulder = (0.0, 0.0, 0.0)
+        wrist = (wrist_r * math.cos(yaw), wrist_r * math.sin(yaw), z)
+        end = (r * math.cos(yaw), r * math.sin(yaw), z)
+
+        dx = wrist[0] - shoulder[0]
+        dy = wrist[1] - shoulder[1]
+        dz = wrist[2] - shoulder[2]
+        l12 = math.sqrt(dx * dx + dy * dy + dz * dz)
+        elbow = None
+        if l12 > 1e-9:
+            # Elbow point is computed in the vertical plane of the arm, then rotated by yaw.
+            local_x = wrist_r
+            local_z = z
+            rr = math.sqrt(local_x * local_x + local_z * local_z)
+            if rr > 1e-9:
+                a = (LINK1 * LINK1 - LINK2 * LINK2 + rr * rr) / (2.0 * rr)
+                hh = LINK1 * LINK1 - a * a
+                if hh >= -1e-9:
+                    hh = math.sqrt(max(0.0, hh))
+                    px = a * local_x / rr
+                    pz = a * local_z / rr
+                    rx = -local_z / rr
+                    rz = local_x / rr
+                    e1 = (px + hh * rx, pz + hh * rz)
+                    e2 = (px - hh * rx, pz - hh * rz)
+                    ex_local, ez = e1 if e1[1] >= e2[1] else e2
+                    elbow = (ex_local * math.cos(yaw), ex_local * math.sin(yaw), ez)
+
+        def project(p):
+            x, y, z_ = p
+            sx = cx + scale * (x - 0.55 * y)
+            sy = cy - scale * (z_ + 0.32 * y)
+            return sx, sy
+
+        def line(p1, p2, **kwargs):
+            x1, y1 = project(p1)
+            x2, y2 = project(p2)
+            c.create_line(x1, y1, x2, y2, **kwargs)
+
+        c.create_text(8, 8, anchor="nw", text="Robot pose", font=("Arial", 10, "bold"))
+        c.create_text(8, 27, anchor="nw", text="blue end link stays parallel to ground")
+
+        for gx in range(-15, 31, 10):
+            line((gx, -15, -BASEHEIGHT), (gx, 25, -BASEHEIGHT), fill="#eeeeee")
+        for gy in range(-10, 31, 10):
+            line((-15, gy, -BASEHEIGHT), (30, gy, -BASEHEIGHT), fill="#eeeeee")
+
+        line((0, 0, -BASEHEIGHT), (0, 0, 0), fill="black", width=4)
+        if elbow is not None:
+            line(shoulder, elbow, fill="#555555", width=5)
+            line(elbow, wrist, fill="#222222", width=5)
+        else:
+            line(shoulder, wrist, fill="#555555", width=5)
+        line(wrist, end, fill="#0066aa", width=5)
+
+        for pnt, radius in [((0, 0, -BASEHEIGHT), 4), (shoulder, 4), (wrist, 4), (end, 4)]:
+            x, y = project(pnt)
+            c.create_oval(x-radius, y-radius, x+radius, y+radius, fill="white", outline="black")
+        if elbow is not None:
+            x, y = project(elbow)
+            c.create_oval(x-4, y-4, x+4, y+4, fill="white", outline="black")
+
+        line((0, 0, -BASEHEIGHT), (18, 0, -BASEHEIGHT), fill="red", arrow=tk.LAST, width=2)
+        line((0, 0, -BASEHEIGHT), (0, 18, -BASEHEIGHT), fill="green", arrow=tk.LAST, width=2)
+        line((0, 0, -BASEHEIGHT), (0, 0, 10), fill="blue", arrow=tk.LAST, width=2)
+        c.create_text(w - 8, 8, anchor="ne", text=f"yaw={self.controller.des_angle:.1f}°")
+
+    def draw_gripper_model(self):
+        c = self.gripper_canvas
+        c.delete("all")
+        w = int(c["width"])
+        h = int(c["height"])
+        cx = w / 2.0
+        cy = h / 2.0 + 8
+        size = 22.0
+
+        twist_deg = ((clamp(self.controller.servo_angles[4], TWIST_MIN, TWIST_MAX))+180)/2
+        theta = math.radians(twist_deg)
+        close_ratio = (self.controller.des_gripper - GRIP_MIN) / (GRIP_MAX - GRIP_MIN)
+        close_ratio = clamp(close_ratio, 0.0, 1.0)
+        gap = 110.0 - 70.0 * close_ratio
+        half_sep = gap / 2.0
+
+        c.create_text(8, 8, anchor="nw", text="Twist / gripper view", font=("Arial", 10, "bold"))
+        c.create_text(8, 28, anchor="nw", text=f"twist = {twist_deg:.1f}°")
+        c.create_text(8, 46, anchor="nw", text=f"gripper = {self.controller.des_gripper:.1f}")
+
+        def rot(x, y):
+            return (
+                cx + x * math.cos(theta) - y * math.sin(theta),
+                cy + x * math.sin(theta) + y * math.cos(theta),
+            )
+
+        def draw_square(center_local_x):
+            pts = [
+                (center_local_x - size / 2.0, -size / 2.0),
+                (center_local_x + size / 2.0, -size / 2.0),
+                (center_local_x + size / 2.0, size / 2.0),
+                (center_local_x - size / 2.0, size / 2.0),
+            ]
+            pts_rot = []
+            for px, py in pts:
+                rx, ry = rot(px, py)
+                pts_rot.extend([rx, ry])
+            c.create_polygon(pts_rot, fill="#dddddd", outline="black", width=2)
+
+        c.create_line(cx - 18, cy, cx + 18, cy, fill="#bbbbbb", dash=(4, 3))
+        c.create_line(cx, cy - 18, cx, cy + 18, fill="#bbbbbb", dash=(4, 3))
+        draw_square(-half_sep)
+        draw_square(+half_sep)
+        c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill="#aa0000", outline="#aa0000")
+
+    def refresh_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_combo["values"] = ports
+        if ports and not self.port_var.get():
+            self.port_var.set(ports[0])
+
+    def connect_serial(self):
+        if self.connected:
+            return
+        port = self.port_var.get().strip()
+        if not port:
+            messagebox.showerror("Error", "Please select a serial port.")
+            return
+        self.serial_reader = SerialReader(
+            port=port,
+            baudrate=BAUD_RATE,
+            packet_callback=self.handle_packet,
+            status_callback=self.set_status
+        )
+        self.serial_reader.start()
+        self.connected = True
+        self.status_var.set(f"Connected to {port}")
+
+    def disconnect_serial(self):
+        if self.serial_reader:
+            self.serial_reader.stop()
+            self.serial_reader = None
+        self.connected = False
+        self.status_var.set("Not connected (inputs assumed zero)")
+        self.touch_count = 0
+        self.digital_touch = 0
+        self.current_touch = 0
+        self.current_avg = None
+
+    def set_status(self, text):
+        self.status_var.set(text)
+
+    def handle_packet(self, packet):
+        ptype = packet.get("type", "emg")
+
+        if ptype == "touch":
+            self.touch_count = 1 if packet.get("touch", 0) else 0
+            self.digital_touch = 1 if packet.get("digital_touch", 0) else 0
+            self.current_touch = 1 if packet.get("current_touch", 0) else 0
+            self.current_avg = packet.get("current_avg", None)
+            return
+
+        if ptype == "emg":
+            self.latest_packet = {
+                "hand": packet.get("hand", 0.0),
+                "biceps": packet.get("biceps", 0.0),
+                "triceps": packet.get("triceps", 0.0),
+                "deltoid": packet.get("deltoid", 0.0),
+                "chest": packet.get("chest", 0.0),
+            }
+            for muscle in MUSCLES:
+                self.buffers[muscle].append(self.latest_packet[muscle])
+                self.features[muscle] = compute_features(self.buffers[muscle])
+
+    def update_zero_input_state_if_disconnected(self):
+        if self.connected:
+            return
+        self.latest_packet = {m: 0.0 for m in MUSCLES}
+        self.touch_count = 0
+        self.digital_touch = 0
+        self.current_touch = 0
+        self.current_avg = None
+        for muscle in MUSCLES:
+            self.buffers[muscle].append(0.0)
+            self.features[muscle] = compute_features(self.buffers[muscle])
+
+    def reset_controller(self):
+        target = {
+            "angle": INITIAL_DES_ANGLE,
+            "height": INITIAL_DES_HEIGHT,
+            "distance": INITIAL_DES_DISTANCE,
+            "twist": clamp(INITIAL_DES_TWIST, TWIST_MIN, TWIST_MAX),
+            "gripper": INITIAL_DES_GRIPPER,
+        }
+        target, was_limited, limit_msg = self.controller.project_target_to_reachable_pose(target)
+        self.position_target = target
+        self.position_target_source = "reset"
+        self.position_warning_var.set("")
+        if was_limited:
+            self.status_var.set("Reset requested. " + limit_msg)
+        else:
+            self.status_var.set("Reset requested. Robot is moving slowly to the initial controller state.")
+        self.root.focus_set()
+
+    def start_calibration(self):
+        if not is_emg_app_mode(self.app_mode_var.get()):
+            return
+        if self.is_calibrating or self.is_testing:
+            return
+        self.training_data = {m: [] for m in MUSCLES}
+        self.models = {m: None for m in MUSCLES}
+        self.update_dataset_labels()
+        self.full_arm_calibration = self.empty_full_arm_calibration()
+        self.body_action_calibration = self.empty_body_action_calibration()
+        self.body_action_model = None
+        self.body_current_action = BODY_ACTION_REST
+        self.body_pending_action = BODY_ACTION_REST
+        self.body_pending_count = 0
+        self.model_var.set("New Full-Arm EMG calibration in progress")
+        self.calibration_sequence = self.build_full_arm_calibration_sequence()
+        self.begin_calibration_sequence()
+
+    def start_single_muscle_calibration(self, muscle):
+        if not is_emg_app_mode(self.app_mode_var.get()):
+            return
+        if self.is_calibrating or self.is_testing:
+            return
+
+        self.training_data[muscle] = []
+        self.models[muscle] = None
+        self.update_dataset_labels()
+
+        self.model_var.set(f"{display_name_for_mode(muscle, self.app_mode_var.get())} calibration in progress")
+        self.calibration_sequence = self.build_calibration_sequence_single(muscle)
+        self.begin_calibration_sequence()
+
+    def start_arm_pair_calibration(self):
+        if not is_emg_app_mode(self.app_mode_var.get()):
+            return
+        if self.is_calibrating or self.is_testing:
+            return
+
+        self.training_data["biceps"] = []
+        self.training_data["triceps"] = []
+        self.models["biceps"] = None
+        self.models["triceps"] = None
+        self.update_dataset_labels()
+
+        self.model_var.set("Biceps/Triceps arm pair calibration in progress")
+        self.calibration_sequence = self.build_arm_pair_calibration_sequence()
+        self.begin_calibration_sequence()
+
+    def begin_calibration_sequence(self):
+        self.current_stage_index = -1
+        self.is_calibrating = True
+        self.current_measurement_index = 0
+        self.measurement_phase = "idle"
+        self.phase_start_time = None
+        self.capture_vectors = []
+        self.touch_count = 0
+        self.next_calibration_stage()
+
+    def build_calibration_sequence_all(self):
+        return [
+            {"target": "hand", "label": 100.0, "base_instruction": "Close your hand, take position, stay still"},
+            {"target": "hand", "label": 0.0, "base_instruction": "Open your hand, take position, stay still"},
+
+            {"target": "biceps", "label": 100.0, "base_instruction": "Close your arm, take position, stay still"},
+            {"target": "triceps", "label": 0.0, "base_instruction": "Close your arm, take position, stay still"},
+
+            {"target": "biceps", "label": 0.0, "base_instruction": "Open your arm, take position, stay still"},
+            {"target": "triceps", "label": 100.0, "base_instruction": "Open your arm, take position, stay still"},
+        ]
+
+    def build_calibration_sequence_single(self, muscle):
+        if muscle == "hand":
+            return [
+                {"target": "hand", "label": 100.0, "base_instruction": "Close your hand, take position, stay still"},
+                {"target": "hand", "label": 0.0, "base_instruction": "Open your hand, take position, stay still"},
+            ]
+        if muscle == "biceps":
+            return [
+                {"target": "biceps", "label": 0.0, "base_instruction": "Relax your biceps / give a low biceps signal, take position, stay still"},
+                {"target": "biceps", "label": 100.0, "base_instruction": "Give a high biceps signal / close your arm, take position, stay still"},
+            ]
+        if muscle == "triceps":
+            return [
+                {"target": "triceps", "label": 0.0, "base_instruction": "Relax your triceps / give a low triceps signal, take position, stay still"},
+                {"target": "triceps", "label": 100.0, "base_instruction": "Give a high triceps signal / open your arm, take position, stay still"},
+            ]
+        if muscle == "deltoid":
+            if self.is_full_arm_emg_mode():
+                return [
+                    {"target": "deltoid", "label": None, "state": "down", "base_instruction": "Keep your arm down, take position, stay still"},
+                    {"target": "deltoid", "label": None, "state": "off", "base_instruction": "Keep your arm in the middle relaxed position, take position, stay still"},
+                    {"target": "deltoid", "label": None, "state": "up", "base_instruction": "Raise your arm up, take position, stay still"},
+                ]
+            return [
+                {"target": "deltoid", "label": 100.0, "base_instruction": "Open your arm, take position, stay still"},
+                {"target": "deltoid", "label": 0.0, "base_instruction": "Close your arm, take position, stay still"},
+            ]
+        if muscle == "chest":
+            return [
+                {"target": "chest", "label": 0.0, "state": "off", "base_instruction": "Relax your chest / give a low chest signal, take position, stay still"},
+                {"target": "chest", "label": 100.0, "state": "plus", "base_instruction": "Give a high chest signal, take position, stay still"},
+            ]
+        return []
+
+    def build_arm_pair_calibration_sequence(self):
+        return [
+            {"target": "biceps", "label": 100.0, "base_instruction": "Close your arm, take position, stay still"},
+            {"target": "triceps", "label": 0.0, "base_instruction": "Close your arm, take position, stay still"},
+
+            {"target": "biceps", "label": 0.0, "base_instruction": "Open your arm, take position, stay still"},
+            {"target": "triceps", "label": 100.0, "base_instruction": "Open your arm, take position, stay still"},
+        ]
+
+    def build_full_arm_calibration_sequence(self):
+        return [
+            # Hand remains independent and uses the old percentage/hysteresis path.
+            {"target": "hand", "label": 100.0, "base_instruction": "Close your hand, take position, stay still"},
+            {"target": "hand", "label": 0.0, "base_instruction": "Open your hand, take position, stay still"},
+
+            # Body actions are calibrated as action classes using biceps, triceps, deltoid, and chest together.
+            {"target": "__body_action__", "action": BODY_ACTION_REST, "label": None,
+             "base_instruction": "Relax biceps, triceps, deltoid, and chest, take position, stay still"},
+            {"target": "__body_action__", "action": BODY_ACTION_ARM_CLOSE, "label": None,
+             "base_instruction": "Close your arm using biceps, take position, stay still"},
+            {"target": "__body_action__", "action": BODY_ACTION_ARM_EXTEND, "label": None,
+             "base_instruction": "Extend your arm using triceps, take position, stay still"},
+            {"target": "__body_action__", "action": BODY_ACTION_HEIGHT_UP, "label": None,
+             "base_instruction": "Raise your arm using deltoid, take position, stay still"},
+            {"target": "__body_action__", "action": BODY_ACTION_HEIGHT_DOWN, "label": None,
+             "base_instruction": "Drop your arm down, take position, stay still"},
+            {"target": "__body_action__", "action": BODY_ACTION_CHEST_ACTIVE, "label": None,
+             "base_instruction": "Activate chest, take position, stay still"},
+        ]
+
+    def next_calibration_stage(self):
+        self.current_stage_index += 1
+        if self.current_stage_index >= len(self.calibration_sequence):
+            self.is_calibrating = False
+            self.current_stage = None
+            self.measurement_phase = "idle"
+            self.calib_var.set("Calibration complete")
+            self.sample_progress_var.set("Collected samples: done")
+            self.countdown_var.set("")
+            self.stage_progress["value"] = 0
+            self.fit_models_from_current_data()
+            self.save_calibration_file()
+            self.model_var.set("Calibration saved and active")
+            messagebox.showinfo("Done", "Calibration finished and saved.")
+            return
+
+        self.current_stage = self.calibration_sequence[self.current_stage_index]
+        self.current_measurement_index = 0
+        self.start_next_measurement()
+
+    def start_next_measurement(self):
+        if self.current_stage is None:
+            return
+        if self.current_measurement_index >= CALIB_MEASUREMENTS_PER_STAGE:
+            self.next_calibration_stage()
+            return
+
+        self.measurement_phase = "countdown"
+        self.phase_start_time = time.time()
+        self.capture_vectors = []
+
+        target = self.current_stage["target"]
+        label = self.current_stage["label"]
+        meas_num = self.current_measurement_index + 1
+        instruction = self.current_stage["base_instruction"]
+
+        if target == "__body_action__":
+            action_text = self.current_stage.get("action", "action")
+            target_text = f"Body action target | {action_text}"
+        elif label is None:
+            state_text = self.current_stage.get("state", "state")
+            target_text = f"{display_name_for_mode(target, self.app_mode_var.get())} target | state {state_text}"
+        else:
+            target_text = f"{display_name_for_mode(target, self.app_mode_var.get())} target | label {label:.0f}%"
+        self.calib_var.set(
+            f"{target_text} | {instruction} "
+            f"({meas_num}/{CALIB_MEASUREMENTS_PER_STAGE})"
+        )
+        self.sample_progress_var.set(
+            f"Collected samples: {self.current_measurement_index} / {CALIB_MEASUREMENTS_PER_STAGE}"
+        )
+
+        self.speak_async(instruction)
+        self.root.after(50, self.monitor_measurement_phase)
+
+    def monitor_measurement_phase(self):
+        if not self.is_calibrating or self.current_stage is None:
+            return
+
+        now = time.time()
+        meas_num = self.current_measurement_index + 1
+
+        total_steps = len(self.calibration_sequence) * CALIB_MEASUREMENTS_PER_STAGE
+        completed_steps = self.current_stage_index * CALIB_MEASUREMENTS_PER_STAGE + self.current_measurement_index
+
+        if self.measurement_phase == "countdown":
+            elapsed = now - self.phase_start_time
+            remaining = max(0.0, COUNTDOWN_SECONDS - elapsed)
+            self.countdown_var.set(
+                f"{self.current_stage['base_instruction']} ({meas_num}/{CALIB_MEASUREMENTS_PER_STAGE}) "
+                f"| Capture in {remaining:.1f} s"
+            )
+            progress = 100.0 * (completed_steps + elapsed / COUNTDOWN_SECONDS) / total_steps
+            self.stage_progress["value"] = progress
+
+            if elapsed >= COUNTDOWN_SECONDS:
+                self.measurement_phase = "capture"
+                self.phase_start_time = now
+                self.capture_vectors = []
+
+            self.root.after(50, self.monitor_measurement_phase)
+            return
+
+        if self.measurement_phase == "capture":
+            elapsed = now - self.phase_start_time
+            target = self.current_stage["target"]
+            if target == "__body_action__":
+                x = self.get_body_action_feature_vector()
+            else:
+                x = get_model_input_vector(self.features, target)
+            self.capture_vectors.append(x.copy())
+
+            self.countdown_var.set(f"HOLD STILL NOW ({meas_num}/{CALIB_MEASUREMENTS_PER_STAGE})")
+            progress = 100.0 * (completed_steps + min(1.0, elapsed / CAPTURE_WINDOW_SEC)) / total_steps
+            self.stage_progress["value"] = progress
+
+            if elapsed >= CAPTURE_WINDOW_SEC:
+                if self.capture_vectors:
+                    stacked = np.vstack(self.capture_vectors)
+                    avg_x = np.mean(stacked, axis=0)
+                    label = self.current_stage.get("label", None)
+                    state = self.current_stage.get("state", None)
+                    action = self.current_stage.get("action", None)
+
+                    if target == "__body_action__" and action is not None:
+                        self.body_action_calibration.setdefault(action, [])
+                        self.body_action_calibration[action].extend(stacked.tolist())
+
+                    else:
+                        if state is not None:
+                            self.full_arm_calibration.setdefault(target, {})[state] = avg_x.tolist()
+
+                        if label is not None:
+                            self.training_data[target].append({
+                                "x": avg_x.tolist(),
+                                "y": float(label)
+                            })
+
+                self.current_measurement_index += 1
+                self.update_dataset_labels()
+
+                if self.current_measurement_index < CALIB_MEASUREMENTS_PER_STAGE:
+                    self.start_next_measurement()
+                else:
+                    self.next_calibration_stage()
+                return
+
+            self.root.after(50, self.monitor_measurement_phase)
+
+    def fit_models_from_current_data(self):
+        success_count = 0
+        for muscle in MUSCLES:
+            model = fit_least_squares_model(self.training_data[muscle])
+            self.models[muscle] = model
+            if model is not None:
+                success_count += 1
+        body_model = self.train_body_action_model()
+        body_count = len(body_model.get("classes", [])) if body_model else 0
+        self.model_var.set(
+            f"Calibration ready for {success_count} / {len(MUSCLES)} muscle models, "
+            f"{body_count} / {len(BODY_ACTION_CLASSES)} body actions"
+        )
+        self.update_dataset_labels()
+
+    def save_calibration_file(self):
+        try:
+            payload = {
+                "training_data": self.training_data,
+                "models": self.models,
+                "full_arm_calibration": self.full_arm_calibration,
+                "body_action_calibration": self.body_action_calibration,
+                "body_action_model": self.body_action_model,
+            }
+            with open(CALIBRATION_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            self.status_var.set(f"Calibration saved to {CALIBRATION_FILE}")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def load_calibration_file(self):
+        try:
+            with open(CALIBRATION_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            td = payload.get("training_data", {})
+            md = payload.get("models", {})
+            fac = payload.get("full_arm_calibration", {})
+            bac = payload.get("body_action_calibration", {})
+            bam = payload.get("body_action_model", None)
+            for muscle in MUSCLES:
+                self.training_data[muscle] = td.get(muscle, [])
+                self.models[muscle] = md.get(muscle, None)
+            self.full_arm_calibration = self.empty_full_arm_calibration()
+            self.body_action_calibration = self.empty_body_action_calibration()
+            self.body_action_model = None
+            for muscle in MUSCLES:
+                if isinstance(fac.get(muscle), dict):
+                    self.full_arm_calibration[muscle].update(fac[muscle])
+            self.body_action_calibration = self.empty_body_action_calibration()
+            if isinstance(bac, dict):
+                for action in BODY_ACTION_CLASSES:
+                    rows = bac.get(action, [])
+                    if isinstance(rows, list):
+                        self.body_action_calibration[action] = rows
+            self.body_action_model = bam if isinstance(bam, dict) else None
+            if self.body_action_model is None:
+                self.train_body_action_model()
+        except FileNotFoundError:
+            self.training_data = {m: [] for m in MUSCLES}
+            self.models = {m: None for m in MUSCLES}
+            self.full_arm_calibration = self.empty_full_arm_calibration()
+            self.body_action_calibration = self.empty_body_action_calibration()
+            self.body_action_model = None
+        except Exception as e:
+            print("Calibration load failed:", e)
+            self.training_data = {m: [] for m in MUSCLES}
+            self.models = {m: None for m in MUSCLES}
+            self.full_arm_calibration = self.empty_full_arm_calibration()
+            self.body_action_calibration = self.empty_body_action_calibration()
+            self.body_action_model = None
+
+    def backfill_full_arm_hand_calibration_from_regression_data(self):
+        """Rebuild missing Full-Arm hand open/closed states from old hand calibration data.
+
+        Older saved calibration files may contain only the hand regression data
+        used by Axis Select EMG Mode.  Full-Arm EMG Mode compares the current
+        RMS/MAV/WL vector directly with full_arm_calibration["hand"]["open"]
+        and full_arm_calibration["hand"]["closed"].  Without these two vectors,
+        the gripper can appear stuck until a brand-new hand calibration is made.
+        """
+        hand_cal = self.full_arm_calibration.setdefault("hand", {})
+        changed = False
+
+        if "open" in hand_cal and "closed" in hand_cal:
+            return False
+
+        open_vectors = []
+        closed_vectors = []
+
+        for sample in self.training_data.get("hand", []):
+            try:
+                x = np.asarray(sample.get("x", []), dtype=float)
+                y = float(sample.get("y", 0.0))
+            except Exception:
+                continue
+
+            if x.size == 0:
+                continue
+
+            if y <= 25.0:
+                open_vectors.append(x)
+            elif y >= 75.0:
+                closed_vectors.append(x)
+
+        if "open" not in hand_cal and open_vectors:
+            hand_cal["open"] = np.mean(np.vstack(open_vectors), axis=0).tolist()
+            changed = True
+
+        if "closed" not in hand_cal and closed_vectors:
+            hand_cal["closed"] = np.mean(np.vstack(closed_vectors), axis=0).tolist()
+            changed = True
+
+        return changed
+
+    def use_existing_calibration(self):
+        if not is_emg_app_mode(self.app_mode_var.get()):
+            return
+        if not os.path.exists(CALIBRATION_FILE):
+            messagebox.showerror("No Calibration Found", "No saved calibration file was found.")
+            return
+
+        self.load_calibration_file()
+        self.fit_models_from_current_data()
+        self.update_dataset_labels()
+
+        if self.is_full_arm_emg_mode() and not self.full_arm_calibration_ready():
+            self.model_var.set("Existing calibration loaded, but Full-Arm calibration is incomplete")
+            self.status_var.set(f"Using saved calibration from {CALIBRATION_FILE}")
+            messagebox.showwarning(
+                "Incomplete Full-Arm Calibration",
+                "Existing calibration was loaded, but the new body-action prototype calibration is incomplete.\n\n"
+                "The hand still uses the independent percentage calibration, but the body controller now needs "
+                "calibrated action classes: rest, arm close, arm extend, height up, height down, and chest active.\n"
+                "Please run a new Full-Arm EMG calibration."
+            )
+        else:
+            self.model_var.set("Existing calibration loaded")
+            self.status_var.set(f"Using saved calibration from {CALIBRATION_FILE}")
+            messagebox.showinfo("Calibration Loaded", "Existing calibration loaded successfully.")
+
+    def update_dataset_labels(self):
+        body_counts = {
+            action: len(self.body_action_calibration.get(action, []))
+            for action in BODY_ACTION_CLASSES
+        } if hasattr(self, "body_action_calibration") else {}
+        body_ready = sum(1 for action in BODY_ACTION_CLASSES if body_counts.get(action, 0) > 0)
+        for muscle in MUSCLES:
+            n = len(self.training_data[muscle])
+            state_count = len(self.full_arm_calibration.get(muscle, {}))
+            if state_count:
+                text = f"{display_name_for_mode(muscle, self.app_mode_var.get())}: {n} regression samples, {state_count} old full-arm states"
+            else:
+                text = f"{display_name_for_mode(muscle, self.app_mode_var.get())}: {n} calibration samples"
+            if muscle == "biceps":
+                text += f" | body actions {body_ready}/{len(BODY_ACTION_CLASSES)}"
+            self.dataset_labels[muscle].config(text=text)
+
+    # -------------------------
+    # Test mode
+    # -------------------------
+    def start_test_mode(self):
+        if not is_emg_app_mode(self.app_mode_var.get()):
+            return
+        if self.is_calibrating or self.is_testing:
+            return
+        if self.is_full_arm_emg_mode():
+            if not self.full_arm_calibration_ready():
+                messagebox.showerror("No Full-Arm Calibration", "Load or create a Full-Arm EMG calibration first.")
+                return
+        elif not any(self.models[m] is not None for m in MUSCLES):
+            messagebox.showerror("No Model", "Load or create a calibration first.")
+            return
+
+        self.is_testing = True
+        self.test_sequence = FULL_ARM_TEST_PROTOCOL[:] if self.is_full_arm_emg_mode() else TEST_PROTOCOL[:]
+        self.current_test_index = -1
+        self.current_test_step = None
+        self.test_phase = "idle"
+        self.test_phase_start_time = None
+        self.test_samples = []
+        self.test_summary = []
+        self.test_progressbar["value"] = 0
+        self.test_var.set("Test mode started")
+        self.next_test_step()
+
+    def stop_test_mode(self):
+        if not self.is_testing:
+            return
+        self.is_testing = False
+        self.current_test_step = None
+        self.test_phase = "idle"
+        self.test_var.set("Test mode stopped")
+        self.test_progress_var.set("")
+        self.test_progressbar["value"] = 0
+
+    def next_test_step(self):
+        self.current_test_index += 1
+        if self.current_test_index >= len(self.test_sequence):
+            self.finish_test_mode()
+            return
+
+        self.current_test_step = self.test_sequence[self.current_test_index]
+        self.test_phase = "countdown"
+        self.test_phase_start_time = time.time()
+
+        text = self.current_test_step["instruction"]
+        self.test_var.set(text)
+        self.speak_async(text)
+
+        self.root.after(50, self.monitor_test_phase)
+
+    def monitor_test_phase(self):
+        if not self.is_testing or self.current_test_step is None:
+            return
+
+        now = time.time()
+        elapsed = now - self.test_phase_start_time
+        total_steps = len(self.test_sequence)
+        base_progress = 100.0 * self.current_test_index / total_steps
+
+        if self.test_phase == "countdown":
+            remaining = max(0.0, TEST_COUNTDOWN_SECONDS - elapsed)
+            self.test_progress_var.set(
+                f"Step {self.current_test_index + 1}/{len(self.test_sequence)} | "
+                f"Get ready: {remaining:.1f} s"
+            )
+            self.test_progressbar["value"] = base_progress + (elapsed / TEST_COUNTDOWN_SECONDS) * (100.0 / total_steps) * 0.35
+
+            if elapsed >= TEST_COUNTDOWN_SECONDS:
+                self.test_phase = "capture"
+                self.test_phase_start_time = now
+
+            self.root.after(50, self.monitor_test_phase)
+            return
+
+        if self.test_phase == "capture":
+            remaining = max(0.0, TEST_CAPTURE_SECONDS - elapsed)
+            self.test_progress_var.set(
+                f"Step {self.current_test_index + 1}/{len(self.test_sequence)} | "
+                f"HOLD: {remaining:.1f} s"
+            )
+
+            self.test_progressbar["value"] = base_progress + 35.0 / total_steps + (elapsed / TEST_CAPTURE_SECONDS) * (100.0 / total_steps) * 0.55
+
+            if elapsed >= TEST_CAPTURE_SECONDS:
+                self.summarize_current_test_step()
+                self.test_phase = "between"
+                self.test_phase_start_time = now
+
+            self.root.after(50, self.monitor_test_phase)
+            return
+
+        if self.test_phase == "between":
+            remaining = max(0.0, TEST_BETWEEN_STEPS_SECONDS - elapsed)
+            self.test_progress_var.set(
+                f"Step {self.current_test_index + 1}/{len(self.test_sequence)} complete | Next in {remaining:.1f} s"
+            )
+            self.test_progressbar["value"] = base_progress + 90.0 / total_steps
+
+            if elapsed >= TEST_BETWEEN_STEPS_SECONDS:
+                self.next_test_step()
+                return
+
+            self.root.after(50, self.monitor_test_phase)
+
+    def record_current_test_sample(self, now):
+        row = {
+            "timestamp": now,
+            "step_index": self.current_test_index,
+            "step_name": self.current_test_step["name"] if self.current_test_step else "",
+            "instruction": self.current_test_step["instruction"] if self.current_test_step else "",
+            "expected_muscle": self.current_test_step["expected_muscle"] if self.current_test_step else "",
+            "expected_state": self.current_test_step["expected_state"] if self.current_test_step else "",
+            "test_phase": self.test_phase,
+            "touch": int(self.touch_count),
+            "digital_touch": int(self.digital_touch),
+            "current_touch": int(self.current_touch),
+            "current_avg": float(self.current_avg) if self.current_avg is not None else float("nan"),
+        }
+
+        if self.is_full_arm_emg_mode():
+            row["body_action"] = self.full_arm_states.get("body_action", BODY_ACTION_REST)
+            row["body_confidence"] = float(self.body_last_confidence)
+            for action in BODY_ACTION_CLASSES:
+                row[f"dist_{action}"] = float(self.body_last_distances.get(action, np.nan))
+            for muscle in MUSCLES:
+                row[f"state_{muscle}"] = self.full_arm_states.get(muscle, "")
+
+        for muscle in MUSCLES:
+            row[f"raw_{muscle}"] = float(self.latest_packet[muscle])
+            row[f"rms_{muscle}"] = float(self.features[muscle]["rms"])
+            row[f"mav_{muscle}"] = float(self.features[muscle]["mav"])
+            row[f"wl_{muscle}"] = float(self.features[muscle]["wl"])
+            row[f"pred_{muscle}"] = float(self.predicted_percentages[muscle])
+
+        self.test_samples.append(row)
+
+    def full_arm_expected_state_matches(self, row, expected_muscle, expected_state):
+        if expected_muscle == "all" and expected_state == "relax":
+            return (
+                row.get("state_hand") == "open" and
+                row.get("state_biceps") == "off" and
+                row.get("state_triceps") == "off" and
+                row.get("state_chest") == "off" and
+                row.get("state_deltoid") in ("off", "down")
+            )
+        if expected_muscle == "both_arm" and expected_state == "off":
+            return row.get("state_biceps") == "off" and row.get("state_triceps") == "off"
+        return row.get(f"state_{expected_muscle}") == expected_state
+
+    def summarize_current_full_arm_test_step(self, step_rows):
+        expected_muscle = self.current_test_step["expected_muscle"]
+        expected_state = self.current_test_step["expected_state"]
+        usable_rows = [r for r in step_rows if r.get("test_phase") == "capture"] or step_rows
+
+        match_count = sum(1 for r in usable_rows if self.full_arm_expected_state_matches(r, expected_muscle, expected_state))
+        match_ratio = match_count / max(1, len(usable_rows))
+        passed = match_ratio >= 0.60
+
+        state_counts = {}
+        for muscle in MUSCLES:
+            counts = {}
+            for r in usable_rows:
+                st = r.get(f"state_{muscle}", "")
+                counts[st] = counts.get(st, 0) + 1
+            state_counts[muscle] = counts
+
+        means = {}
+        for muscle in MUSCLES:
+            vals = [r[f"pred_{muscle}"] for r in usable_rows]
+            means[muscle] = float(np.mean(vals)) if vals else 0.0
+
+        self.test_summary.append({
+            "step_index": self.current_test_index,
+            "step_name": self.current_test_step["name"],
+            "instruction": self.current_test_step["instruction"],
+            "expected_muscle": expected_muscle,
+            "expected_state": expected_state,
+            "full_arm_state_counts": state_counts,
+            "mean_predictions": means,
+            "match_ratio": match_ratio,
+            "passed": bool(passed),
+        })
+
+    def summarize_current_test_step(self):
+        step_rows = [r for r in self.test_samples if r["step_index"] == self.current_test_index]
+        if not step_rows:
+            return
+
+        if self.is_full_arm_emg_mode():
+            self.summarize_current_full_arm_test_step(step_rows)
+            return
+
+        means = {}
+        for muscle in MUSCLES:
+            vals = [r[f"pred_{muscle}"] for r in step_rows]
+            means[muscle] = float(np.mean(vals)) if vals else 0.0
+
+        expected_muscle = self.current_test_step["expected_muscle"]
+        expected_state = self.current_test_step["expected_state"]
+        dominant_muscle = max(means, key=means.get)
+
+        if expected_muscle == "both_arm" and expected_state == "low":
+            biceps_mean = means["biceps"]
+            triceps_mean = means.get("triceps", 0.0)
+            target_mean = max(biceps_mean, triceps_mean)
+            passed = (biceps_mean <= REST_PASS_THRESHOLD) and (triceps_mean <= REST_PASS_THRESHOLD)
+        elif expected_state == "high":
+            target_mean = means[expected_muscle]
+            passed = (target_mean >= ACTIVE_PASS_THRESHOLD) and (dominant_muscle == expected_muscle)
+        else:
+            target_mean = means[expected_muscle]
+            passed = target_mean <= REST_PASS_THRESHOLD
+
+        self.test_summary.append({
+            "step_index": self.current_test_index,
+            "step_name": self.current_test_step["name"],
+            "instruction": self.current_test_step["instruction"],
+            "expected_muscle": expected_muscle,
+            "expected_state": expected_state,
+            "mean_predictions": means,
+            "dominant_muscle": dominant_muscle,
+            "target_mean": target_mean,
+            "biceps_mean": means["biceps"],
+            "triceps_mean": means.get("triceps", 0.0),
+            "passed": bool(passed),
+        })
+
+    def finish_test_mode(self):
+        self.is_testing = False
+        self.current_test_step = None
+        self.test_phase = "idle"
+        self.test_var.set("Test complete")
+        self.test_progress_var.set("Saving test results...")
+        self.test_progressbar["value"] = 100
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(RESULTS_DIR, f"emg_test_samples_{timestamp}.csv")
+        json_path = os.path.join(RESULTS_DIR, f"emg_test_summary_{timestamp}.json")
+
+        try:
+            self.save_test_samples_csv(csv_path)
+            self.save_test_summary_json(json_path)
+
+            passed_count = sum(1 for s in self.test_summary if s["passed"])
+            msg = (
+                f"Test finished.\n\n"
+                f"Passed steps: {passed_count} / {len(self.test_summary)}\n\n"
+                f"Saved:\n{csv_path}\n{json_path}"
+            )
+            self.test_progress_var.set(f"Saved test results to {RESULTS_DIR}")
+            messagebox.showinfo("Test Complete", msg)
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def save_test_samples_csv(self, path):
+        if not self.test_samples:
+            return
+        fieldnames = list(self.test_samples[0].keys())
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.test_samples)
+
+    def save_test_summary_json(self, path):
+        payload = {
+            "created_at": datetime.now().isoformat(),
+            "protocol": self.test_sequence,
+            "app_mode": self.app_mode_var.get(),
+            "use_independent_muscle_mode": USE_INDEPENDENT_MUSCLE_MODE,
+            "use_wl_only_mode": USE_WL_ONLY_MODE,
+            "summary": self.test_summary,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+
+    # -------------------------
+    # Video based control
+    # -------------------------
+    def create_video_landmarkers(self):
+        if not VIDEO_AVAILABLE:
+            raise RuntimeError("OpenCV / MediaPipe is not available in this Python environment.")
+        if not os.path.exists(POSE_MODEL_PATH):
+            raise FileNotFoundError(f"Missing pose model: {POSE_MODEL_PATH}")
+        if not os.path.exists(HAND_MODEL_PATH):
+            raise FileNotFoundError(f"Missing hand model: {HAND_MODEL_PATH}")
+
+        base_pose = mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH)
+        pose_options = mp_vision.PoseLandmarkerOptions(
+            base_options=base_pose,
+            running_mode=mp_vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            output_segmentation_masks=False,
+        )
+        self.pose_landmarker = mp_vision.PoseLandmarker.create_from_options(pose_options)
+
+        base_hand = mp_python.BaseOptions(model_asset_path=HAND_MODEL_PATH)
+        hand_options = mp_vision.HandLandmarkerOptions(
+            base_options=base_hand,
+            running_mode=mp_vision.RunningMode.VIDEO,
+            num_hands=2,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self.hand_landmarker = mp_vision.HandLandmarker.create_from_options(hand_options)
+
+    def start_camera(self):
+        if self.camera_running:
+            return
+        try:
+            self.create_video_landmarkers()
+        except Exception as e:
+            messagebox.showerror(
+                "Model Error",
+                "Could not initialize the video models.\n\n"
+                f"{e}\n\n"
+                "Place these files next to the script:\n"
+                "- pose_landmarker.task\n"
+                "- hand_landmarker.task"
+            )
+            return
+
+        self.cap = cv2.VideoCapture(CAMERA_INDEX)
+        if self.cap is None or not self.cap.isOpened():
+            messagebox.showerror("Camera Error", "Could not open the camera.")
+            self.stop_camera()
+            return
+
+        with self.video_frame_lock:
+            self.video_samples.clear()
+            self.latest_video_bgr = None
+        self.camera_running = True
+        self.camera_thread = threading.Thread(target=self.camera_loop, daemon=True)
+        self.camera_thread.start()
+        self.video_status_var.set("Camera running")
+
+    def stop_camera(self):
+        self.camera_running = False
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+        if self.pose_landmarker is not None:
+            try:
+                self.pose_landmarker.close()
+            except Exception:
+                pass
+            self.pose_landmarker = None
+        if self.hand_landmarker is not None:
+            try:
+                self.hand_landmarker.close()
+            except Exception:
+                pass
+            self.hand_landmarker = None
+        with self.video_frame_lock:
+            self.video_samples.clear()
+        self.video_status_var.set("Camera stopped")
+
+    def camera_loop(self):
+        while self.camera_running and self.cap is not None:
+            ok, frame = self.cap.read()
+            if not ok:
+                self.video_status_var.set("Camera read failed")
+                time.sleep(0.05)
+                continue
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            timestamp_ms = int(time.time() * 1000)
+            pose_result = None
+            hand_result = None
+
+            try:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                pose_result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+            except Exception:
+                pass
+            try:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                hand_result = self.hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+            except Exception:
+                pass
+
+            side = self.get_video_arm_side()
+            r_cm, theta, z_cm = self.estimate_tracked_hand_cylindrical(pose_result, side)
+            squeeze = self.estimate_tracked_hand_squeeze(hand_result, side)
+            twist = self.estimate_tracked_hand_twist(hand_result, side)
+
+            drawn = frame.copy()
+            self.draw_video_pose(drawn, pose_result, side)
+            self.draw_video_hand(drawn, hand_result, side)
+
+            # Mirror only for display. Draw the text after mirroring so the text is not reversed.
+            drawn = cv2.flip(drawn, 1)
+            self.draw_video_overlay(drawn, r_cm, theta, z_cm, squeeze, twist)
+
+            now = time.time()
+            with self.video_frame_lock:
+                self.latest_video_bgr = drawn
+                self.video_samples.append((now, r_cm, theta, z_cm, squeeze, twist))
+                while self.video_samples and (now - self.video_samples[0][0]) > VIDEO_SMOOTHING_SEC:
+                    self.video_samples.popleft()
+
+        self.camera_running = False
+
+    def get_video_arm_side(self):
+        side = str(self.video_arm_side_var.get()).strip().lower()
+        return "left" if side == "left" else "right"
+
+    def get_pose_indices_for_side(self, side):
+        if side == "left":
+            return {"shoulder": 11, "elbow": 13, "wrist": 15, "other_shoulder": 12, "handedness": "left"}
+        return {"shoulder": 12, "elbow": 14, "wrist": 16, "other_shoulder": 11, "handedness": "right"}
+
+    def estimate_tracked_hand_cylindrical(self, pose_result, side):
+        """Return (r_cm, theta_deg, z_cm) for selected arm, or None values if unreadable.
+
+        r is intentionally based on the image-horizontal shoulder-to-wrist distance,
+        so when the wrist is horizontally aligned with the shoulder, r tends toward 0.
+        This avoids the old behavior where depth alone could keep r around 30 cm.
+        """
+        if pose_result is None or not pose_result.pose_landmarks:
+            return None, None, None
+
+        idx = self.get_pose_indices_for_side(side)
+        lms2d = pose_result.pose_landmarks[0]
+        sh2 = lms2d[idx["shoulder"]]
+        wr2 = lms2d[idx["wrist"]]
+        other_sh2 = lms2d[idx["other_shoulder"]]
+
+        shoulder_width_norm = abs(float(sh2.x) - float(other_sh2.x))
+        if shoulder_width_norm < 0.02:
+            # Fallback: roughly maps normalized screen width to centimeters.
+            cm_per_norm = 100.0
+        else:
+            # Approximate adult shoulder width. This makes the output readable in cm.
+            cm_per_norm = 40.0 / shoulder_width_norm
+
+        # Use only the image-horizontal component for r, as requested.
+        dx_img = float(wr2.x) - float(sh2.x)
+        r_cm = abs(dx_img) * cm_per_norm
+
+        # Positive z means wrist is above the shoulder in the preview/body frame.
+        z_cm = -(float(wr2.y) - float(sh2.y)) * cm_per_norm
+
+        theta = None
+        if pose_result.pose_world_landmarks:
+            world = pose_result.pose_world_landmarks[0]
+            sh3 = world[idx["shoulder"]]
+            wr3 = world[idx["wrist"]]
+            lateral_cm = 100.0 * (float(wr3.x) - float(sh3.x))
+            depth_cm = 100.0 * (float(wr3.z) - float(sh3.z))
+            if side == "left":
+                lateral_cm = -lateral_cm
+            if abs(lateral_cm) > 1e-6 or abs(depth_cm) > 1e-6:
+                # Sign matches the robot's shoulder/base angle convention.
+                theta = -1.0 * math.degrees(math.atan2(depth_cm, lateral_cm))
+                theta = float(clamp(theta, ANGLE_MIN, ANGLE_MAX))
+
+        if theta is None:
+            theta = 0.0
+
+        return float(r_cm), float(theta), float(z_cm)
+
+    def find_tracked_hand_index(self, hand_result, side):
+        if hand_result is None or not hand_result.hand_landmarks or not hand_result.handedness:
+            return None
+        wanted = "left" if side == "left" else "right"
+        for i, handed in enumerate(hand_result.handedness):
+            if handed and handed[0].category_name.lower() == wanted:
+                return i
+        return None
+
+    def estimate_tracked_hand_squeeze(self, hand_result, side):
+        hand_index = self.find_tracked_hand_index(hand_result, side)
+        if hand_index is None:
+            return None
+
+        lms = hand_result.hand_landmarks[hand_index]
+
+        def p(i):
+            return np.array([lms[i].x, lms[i].y], dtype=float)
+
+        wrist = p(0)
+        index_mcp = p(5)
+        pinky_mcp = p(17)
+        middle_mcp = p(9)
+        hand_scale = np.linalg.norm(index_mcp - pinky_mcp)
+        if hand_scale < 1e-9:
+            return None
+
+        # More stable squeeze estimate than the old single openness formula:
+        # use the four long fingers, normalize by palm size, and take a median so one bad fingertip does not dominate.
+        finger_tips = [8, 12, 16, 20]
+        norm_tip_dists = [np.linalg.norm(p(i) - wrist) / hand_scale for i in finger_tips]
+        openness = float(np.median(norm_tip_dists))
+
+        # Add a second cue: fingertips moving closer to the palm center means the hand is closing.
+        palm_center = (wrist + index_mcp + middle_mcp + pinky_mcp) / 4.0
+        norm_palm_dists = [np.linalg.norm(p(i) - palm_center) / hand_scale for i in finger_tips]
+        palm_openness = float(np.median(norm_palm_dists))
+
+        # These constants are intentionally wider than before to reduce noisy jumps.
+        squeeze_from_wrist = 100.0 * (1.0 - (openness - 1.35) / 1.35)
+        squeeze_from_palm = 100.0 * (1.0 - (palm_openness - 1.05) / 1.05)
+        squeeze = 0.55 * squeeze_from_wrist + 0.45 * squeeze_from_palm
+        return float(clamp(squeeze, 0.0, 100.0))
+
+    def estimate_tracked_hand_twist(self, hand_result, side):
+        """Estimate palm pose for video twist classification.
+
+        Returns a raw palm-orientation estimate in 0..180 degrees:
+          near   0: palm-down-like pose
+          near  90: perpendicular-like pose
+          near 180: palm-up-like pose
+
+        The robot command is not set continuously from this number.  It is later
+        classified into exactly one of the three internal twist setpoints:
+        TWIST_MAX, 0, or TWIST_MIN.
+        """
+        hand_index = self.find_tracked_hand_index(hand_result, side)
+        if hand_index is None:
+            return None
+
+        lms = hand_result.hand_landmarks[hand_index]
+
+        def p3(i):
+            return np.array([lms[i].x, lms[i].y, lms[i].z], dtype=float)
+
+        wrist = p3(0)
+        index_mcp = p3(5)
+        pinky_mcp = p3(17)
+
+        v_index = index_mcp - wrist
+        v_pinky = pinky_mcp - wrist
+        normal = np.cross(v_index, v_pinky)
+        norm_n = np.linalg.norm(normal)
+        if norm_n < 1e-9:
+            return None
+        normal = normal / norm_n
+
+        # In image coordinates +y points downward.  The selected-hand sign keeps
+        # the down/up interpretation consistent between left and right arms.
+        ny = float(normal[1])
+        if side == "left":
+            ny = -ny
+
+        raw = math.degrees(math.acos(clamp(ny, -1.0, 1.0)))
+        return float(clamp(raw, 0.0, 180.0))
+
+    def draw_video_pose(self, frame, pose_result, side):
+        if pose_result is None or not pose_result.pose_landmarks:
+            return
+        h, w = frame.shape[:2]
+        lms = pose_result.pose_landmarks[0]
+        idx = self.get_pose_indices_for_side(side)
+        pts = {}
+        for i in (idx["shoulder"], idx["elbow"], idx["wrist"]):
+            x, y = int(lms[i].x * w), int(lms[i].y * h)
+            pts[i] = (x, y)
+            cv2.circle(frame, (x, y), 6, (0, 255, 0), -1)
+        for a, b in ((idx["shoulder"], idx["elbow"]), (idx["elbow"], idx["wrist"])):
+            if a in pts and b in pts:
+                cv2.line(frame, pts[a], pts[b], (0, 200, 0), 2)
+
+    def draw_video_hand(self, frame, hand_result, side):
+        if hand_result is None or not hand_result.hand_landmarks or not hand_result.handedness:
+            return
+        h, w = frame.shape[:2]
+        wanted = "left" if side == "left" else "right"
+        connections = [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),(13,17),(17,18),(18,19),(19,20),(0,17)]
+        for i, handed in enumerate(hand_result.handedness):
+            if not handed or handed[0].category_name.lower() != wanted:
+                continue
+            lms = hand_result.hand_landmarks[i]
+            pts = {}
+            for j, lm in enumerate(lms):
+                x, y = int(lm.x * w), int(lm.y * h)
+                pts[j] = (x, y)
+                cv2.circle(frame, (x, y), 4, (255, 140, 0), -1)
+            for a, b in connections:
+                if a in pts and b in pts:
+                    cv2.line(frame, pts[a], pts[b], (255, 180, 60), 2)
+
+    def draw_video_overlay(self, frame, r_cm, theta, z_cm, squeeze, twist):
+        def fmt(v, pattern):
+            return "--" if v is None else pattern.format(v)
+        texts = [
+            f"arm = {self.get_video_arm_side()}",
+            f"r = {fmt(r_cm, '{:.1f}')} cm",
+            f"theta = {fmt(theta, '{:.2f}')} deg",
+            f"z = {fmt(z_cm, '{:.1f}')} cm",
+            f"sqz = {fmt(squeeze, '{:.1f}')}",
+            f"palm pose = {fmt(twist, '{:.1f}')} deg",
+        ]
+        for i, txt in enumerate(texts):
+            cv2.putText(frame, txt, (20, 35 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+
+    def get_smoothed_video_values(self):
+        now = time.time()
+        with self.video_frame_lock:
+            while self.video_samples and (now - self.video_samples[0][0]) > VIDEO_SMOOTHING_SEC:
+                self.video_samples.popleft()
+            samples = list(self.video_samples)
+        if not samples:
+            return None
+
+        values = []
+        for col in range(1, 6):
+            col_vals = [s[col] for s in samples if s[col] is not None]
+            if col_vals:
+                # Median is more robust to occasional bad MediaPipe landmarks than a plain mean.
+                values.append(float(np.median(col_vals)))
+            else:
+                values.append(None)
+        return tuple(values)
+
+    def update_video_preview(self):
+        with self.video_frame_lock:
+            frame = None if self.latest_video_bgr is None else self.latest_video_bgr.copy()
+        if frame is None:
+            return
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (VIDEO_PREVIEW_WIDTH, VIDEO_PREVIEW_HEIGHT))
+        img = Image.fromarray(frame)
+        self.video_preview_image = ImageTk.PhotoImage(image=img)
+        self.video_label.configure(image=self.video_preview_image, text="")
+
+    def classify_video_twist_to_internal(self, twist_deg):
+        """Convert raw palm orientation to one of three internal twist setpoints.
+
+        This restores the earlier behavior: video mode only asks for min, middle,
+        or max twist.  It never asks for an in-between twist value.
+        """
+        if twist_deg is None:
+            return None
+        t = float(twist_deg)
+        if t < 90.0:
+            return TWIST_MAX      # GUI convention: 0 deg
+        elif t > 89.0:
+            return TWIST_MIN      # GUI convention: 180 deg
+        return (TWIST_MAX + TWIST_MIN) / 2          # GUI convention: -90 deg
+
+    def choose_stable_video_twist_target(self, current_raw_twist):
+        """Majority-vote twist decision over recent samples.
+
+        The output is always TWIST_MIN, 0, or TWIST_MAX.  A new decision must have
+        at least VIDEO_TWIST_SWITCH_MAJORITY of recent votes, otherwise the
+        previous decision is held to avoid jitter.
+        """
+        if current_raw_twist is None:
+            return self.video_twist_decision
+        now = time.time()
+        with self.video_frame_lock:
+            recent = [s[5] for s in self.video_samples
+                      if s[5] is not None and (now - s[0]) <= VIDEO_TWIST_SMOOTHING_SEC]
+        votes = [self.classify_video_twist_to_internal(v) for v in recent]
+        votes = [v for v in votes if v is not None]
+        if not votes:
+            return self.video_twist_decision
+
+        candidates = [TWIST_MIN, 0.0, TWIST_MAX]
+        counts = {c: votes.count(c) for c in candidates}
+        winner = max(candidates, key=lambda c: counts[c])
+        if counts[winner] / len(votes) >= VIDEO_TWIST_SWITCH_MAJORITY:
+            self.video_twist_decision = winner
+        return self.video_twist_decision
+
+    def video_values_to_robot_target(self, r_cm, theta, z_cm, squeeze, twist):
+        target = {
+            "angle": self.controller.des_angle,
+            "height": self.controller.des_height,
+            "distance": self.controller.des_distance,
+            "twist": self.controller.servo_angles[4],
+            "gripper": self.controller.des_gripper,
+        }
+
+        if theta is not None:
+            target["angle"] = clamp(theta, ANGLE_MIN, ANGLE_MAX)
+        if r_cm is not None:
+            # r_cm is now the image-horizontal shoulder-to-wrist distance in cm.
+            target["distance"] = clamp(GRIPPER_BASE_LENGTH + 0.50 * r_cm, DIST_MIN, DIST_MAX)
+        if z_cm is not None:
+            target["height"] = clamp(INITIAL_DES_HEIGHT + 0.35 * z_cm, HEIGHT_MIN, HEIGHT_MAX)
+        if twist is not None:
+            target["twist"] = self.choose_stable_video_twist_target(twist)
+        if squeeze is not None:
+            grip_on = float(self.video_grip_on_threshold_var.get())
+            grip_off = float(self.video_grip_off_threshold_var.get())
+            if squeeze >= grip_on:
+                self.video_grip_closed = True
+            elif squeeze <= grip_off:
+                self.video_grip_closed = False
+            target["gripper"] = GRIP_MAX if self.video_grip_closed else GRIP_MIN
+            self.apply_contact_limit_to_target(target)
+
+        return target
+
+    def process_video_control(self, now):
+        vals = self.get_smoothed_video_values()
+        if vals is None:
+            self.video_target_warning_var.set("Waiting for video landmarks...")
+            return
+        r_cm, theta, z_cm, squeeze, twist = vals
+
+        if r_cm is not None:
+            self.video_r_var.set(f"{r_cm:.1f}")
+        if theta is not None:
+            self.video_theta_var.set(f"{theta:.2f}")
+        if z_cm is not None:
+            self.video_z_var.set(f"{z_cm:.1f}")
+        if squeeze is not None:
+            self.video_squeeze_var.set(f"{squeeze:.1f}")
+        if twist is not None:
+            chosen_twist = self.choose_stable_video_twist_target(twist)
+            self.video_twist_var.set(f"raw {twist:.1f} -> cmd {chosen_twist:.1f}")
+
+        if all(v is None for v in (r_cm, theta, z_cm, squeeze, twist)):
+            self.video_target_warning_var.set("No selected arm/hand landmarks detected.")
+            return
+
+        target = self.video_values_to_robot_target(r_cm, theta, z_cm, squeeze, twist)
+        contact_limited = self.apply_contact_limit_to_target(target)
+        target, was_limited, limit_msg = self.controller.project_target_to_reachable_pose(target)
+        contact_limited = self.apply_contact_limit_to_target(target) or contact_limited
+        if contact_limited:
+            self.video_target_warning_var.set("Contact detected: gripper closing limited.")
+        elif was_limited:
+            self.video_target_warning_var.set(limit_msg)
+        else:
+            self.video_target_warning_var.set("")
+        if (now - self.last_position_step_time) >= CONTROL_REPEAT_SEC:
+            self.controller.step_towards_position_target(target, speed_multiplier=VIDEO_SPEED_MULTIPLIER)
+            self.last_position_step_time = now
+
+    # -------------------------
+    # UI loop
+    # -------------------------
+    def update_ui_loop(self):
+        self.update_zero_input_state_if_disconnected()
+
+        if self.touch_count:
+            sources = []
+            if self.digital_touch:
+                sources.append("touch")
+            if self.current_touch:
+                sources.append("current")
+            if not sources:
+                sources.append("unknown")
+            if self.current_avg is None:
+                self.contact_var.set(f"CONTACT DETECTED ({'+'.join(sources)}, A0 avg=N/A)")
+            else:
+                self.contact_var.set(f"CONTACT DETECTED ({'+'.join(sources)}, A0 avg={self.current_avg:.1f})")
+        else:
+            if self.current_avg is None:
+                self.contact_var.set("NO CONTACT (A0 avg=N/A)")
+            else:
+                self.contact_var.set(f"NO CONTACT (A0 avg={self.current_avg:.1f})")
+
+        for muscle in MUSCLES:
+            raw = self.latest_packet[muscle]
+            feats = self.features[muscle]
+            x = get_model_input_vector(self.features, muscle)
+            y = predict_with_model(self.models[muscle], x)
+            self.predicted_percentages[muscle] = y
+
+            self.raw_vars[muscle].set(f"{raw:.3f}")
+            self.rms_vars[muscle].set(f"{feats['rms']:.3f}")
+            self.mav_vars[muscle].set(f"{feats['mav']:.3f}")
+            self.wl_vars[muscle].set(f"{feats['wl']:.3f}")
+            self.percent_vars[muscle].set(f"{y:.1f} %")
+            self.progressbars[muscle]["value"] = y
+
+        now_for_feature_history = time.time()
+        self.update_body_feature_history()
+        self.update_deltoid_zero_feature_history(now_for_feature_history)
+
+        if self.is_testing and self.is_full_arm_emg_mode():
+            states = self.classify_full_arm_inputs()
+            self.update_full_arm_bar_display(states)
+
+        if self.is_testing:
+            self.record_current_test_sample(time.time())
+
+        now = time.time()
+
+        if not self.is_calibrating and not self.is_testing:
+            app_mode = self.app_mode_var.get()
+
+            if self.position_target is not None:
+                if (now - self.last_position_step_time) >= CONTROL_REPEAT_SEC:
+                    contact_limited = self.apply_contact_limit_to_target(self.position_target)
+                    reached = self.controller.step_towards_position_target(self.position_target)
+                    self.last_position_step_time = now
+                    if contact_limited and self.position_target_source == "position":
+                        self.position_warning_var.set("Contact detected: gripper closing limited.")
+                    if reached:
+                        source = self.position_target_source
+                        self.position_target = None
+                        self.position_target_source = None
+                        self.sync_position_entries_from_controller()
+                        if source == "position":
+                            self.position_warning_var.set("Target reached.")
+                        elif source == "reset":
+                            self.status_var.set("Initial controller state reached.")
+                mode_text = "MOVING"
+
+            elif app_mode == APP_MODE_FULL_ARM_EMG:
+                states = self.classify_full_arm_inputs()
+                self.update_full_arm_bar_display(states)
+                self.controller.apply_full_arm_state_control(states, self.predicted_percentages, self.touch_count, now)
+                self.controller.run_ik_and_update_servos()
+                mode_text = "FULL ARM PROTOTYPE | hand->grip={} body_action={} conf={:.2f} deltoidZeroDown={}".format(
+                    states.get("hand", "-"),
+                    self.full_arm_states.get("body_action", BODY_ACTION_REST),
+                    self.body_last_confidence,
+                    "ON" if (USE_DELTOID_ZERO_ARM_DOWN_OVERRIDE and self.deltoid_zero_arm_down_detected()) else "OFF",
+                )
+
+            elif app_mode == APP_MODE_KEYBOARD:
+                self.process_held_keyboard_controls(now)
+                self.controller.run_ik_and_update_servos()
+                mode_text = "KEYBOARD"
+
+            elif app_mode == APP_MODE_POSITION:
+                self.controller.run_ik_and_update_servos()
+                mode_text = "POSITION"
+
+            elif app_mode == APP_MODE_VIDEO:
+                self.process_video_control(now)
+                self.controller.run_ik_and_update_servos()
+                mode_text = "VIDEO"
+
+            else:
+                mode_text = "UNKNOWN"
+
+            self.control_var.set(
+                "Mode: {} | desAngle={:.2f}, desHeight={:.2f}, desDistance={:.2f}, twist={:.2f}, desGripper={:.2f}".format(
+                    mode_text,
+                    self.controller.des_angle,
+                    self.controller.des_height,
+                    self.controller.des_distance,
+                    self.controller.servo_angles[4],
+                    self.controller.des_gripper,
+                )
+            )
+
+            cmd = self.controller.get_servo_command_line()
+            self.servo_var.set(f"Servo cmd: {cmd.strip()}")
+
+            if (
+                SEND_SERVO_COMMANDS_TO_ARDUINO
+                and self.connected
+                and self.serial_reader is not None
+                and (now - self.last_servo_send_time) >= self.servo_send_interval_sec
+            ):
+                try:
+                    self.serial_reader.write_line(cmd)
+                    self.last_servo_send_time = now
+                except Exception:
+                    pass
+
+        elif self.is_calibrating:
+            self.control_var.set("CALIBRATING... robot desired values frozen")
+            self.servo_var.set("Servo cmd: paused during calibration")
+
+        elif self.is_testing:
+            self.control_var.set("TEST MODE... robot desired values frozen")
+            self.servo_var.set("Servo cmd: paused during test mode")
+
+        if self.app_mode_var.get() == APP_MODE_VIDEO:
+            self.update_video_preview()
+
+        if bool(self.graphics_enabled_var.get()):
+            self.draw_robot_model()
+        self.root.after(UI_REFRESH_MS, self.update_ui_loop)
+
+    def on_close(self):
+        self.stop_camera()
+        self.disconnect_serial()
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    app = EMGApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
