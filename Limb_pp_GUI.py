@@ -3676,11 +3676,10 @@ class EMGApp:
                 self.update_full_arm_bar_display(states)
                 self.controller.apply_full_arm_state_control(states, self.predicted_percentages, self.touch_count, now)
                 self.controller.run_ik_and_update_servos()
-                mode_text = "FULL ARM PROTOTYPE | hand->grip={} body_action={} conf={:.2f} deltoidZeroDown={}".format(
+                mode_text = "FULL ARM | hand->grip={} body_action={} conf={:.2f} ".format(
                     states.get("hand", "-"),
                     self.full_arm_states.get("body_action", BODY_ACTION_REST),
                     self.body_last_confidence,
-                    "ON" if (USE_DELTOID_ZERO_ARM_DOWN_OVERRIDE and self.deltoid_zero_arm_down_detected()) else "OFF",
                 )
 
             elif app_mode == APP_MODE_KEYBOARD:
