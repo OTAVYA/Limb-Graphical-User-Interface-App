@@ -105,6 +105,21 @@ LOGO_FILE = os.path.join(SCRIPT_DIR, "logo.png")
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "emg_test_results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+# Action images are loaded from a folder placed next to this Python file.
+# Put the supplied PNG files in:  <folder containing this code>/actionImages/
+ACTION_IMAGES_DIR = os.path.join(SCRIPT_DIR, "actionImages")
+ACTION_IMAGE_SIZE = (260, 260)
+ACTION_IMAGE_FILES = {
+    "hand_open": "haandopenman.png",
+    "hand_close": "haandcloseman.png",
+    "chest_active": "chestactivateman.png",
+    "drop_down": "downdropman.png",
+    "raise": "raiseman.png",
+    "extend": "extendman.png",
+    "flex": "flexman.png",
+    "relax": "relaxman.png",
+}
+
 # internal names stay the same
 MUSCLES = ["hand", "biceps", "triceps", "deltoid", "chest"]
 DISPLAY_NAMES = {
@@ -956,6 +971,11 @@ class EMGApp:
 
         self.logo_img = None
         self.logo_label = None
+        self.action_image_cache = {}
+        self.current_action_image_key = None
+        self.action_image_photo = None
+        self.action_image_label = None
+        self.action_image_title_var = tk.StringVar(value="Action image")
         self.serial_reader = None
         self.connected = False
 
@@ -1781,7 +1801,13 @@ class EMGApp:
         self.robot_canvas = tk.Canvas(self.graphics_frame, width=260, height=170, bg="white", highlightthickness=1, highlightbackground="#cccccc")
         self.robot_canvas.pack(anchor="ne", padx=5, pady=(0, 5))
         self.gripper_canvas = tk.Canvas(self.graphics_frame, width=260, height=105, bg="white", highlightthickness=1, highlightbackground="#cccccc")
-        self.gripper_canvas.pack(anchor="ne", padx=5, pady=(0, 0))
+        self.gripper_canvas.pack(anchor="ne", padx=5, pady=(0, 5))
+
+        self.action_image_frame = ttk.LabelFrame(self.graphics_frame, text="Current Action", padding=6)
+        self.action_image_frame.pack(anchor="ne", padx=5, pady=(0, 0), fill="x")
+        ttk.Label(self.action_image_frame, textvariable=self.action_image_title_var, font=("Arial", 9, "bold")).pack(anchor="center", pady=(0, 4))
+        self.action_image_label = ttk.Label(self.action_image_frame, text="No calibration/test action")
+        self.action_image_label.pack(anchor="center")
 
         controls = ttk.Frame(self.scrollable_frame, padding=10)
         controls.pack(fill="x")
@@ -2215,6 +2241,117 @@ class EMGApp:
             self.controller.servo_angles[4] = clamp(self.controller.servo_angles[4], TWIST_MIN, TWIST_MAX)
             self.controller.run_ik_and_update_servos()
             self.last_keyboard_step_time = now
+
+    def get_action_image_key_from_instruction(self, instruction, target=None, label=None, state=None, action=None):
+        """Map calibration/test instructions to one of the action image files."""
+        text = str(instruction or "").lower()
+        target = str(target or "").lower()
+        state = str(state or "").lower()
+        action = str(action or "")
+
+        if target == "__body_action__":
+            if action == BODY_ACTION_REST:
+                return "relax"
+            if action == BODY_ACTION_ARM_CLOSE:
+                return "flex"
+            if action == BODY_ACTION_ARM_EXTEND:
+                return "extend"
+            if action == BODY_ACTION_HEIGHT_UP:
+                return "raise"
+            if action == BODY_ACTION_HEIGHT_DOWN:
+                return "drop_down"
+            if action == BODY_ACTION_CHEST_ACTIVE:
+                return "chest_active"
+
+        if target == "hand":
+            if label is not None:
+                try:
+                    return "hand_close" if float(label) >= 50.0 else "hand_open"
+                except Exception:
+                    pass
+            if "close" in text or "closed" in text:
+                return "hand_close"
+            if "open" in text:
+                return "hand_open"
+
+        if target == "biceps" or "close your arm" in text or "close arm" in text or "flex" in text:
+            return "flex"
+        if target == "triceps" or "extend" in text or "open your arm" in text or "open arm" in text:
+            return "extend"
+        if target == "chest" or "chest" in text:
+            if state in {"off", "relax"} or "relax" in text or "low chest" in text:
+                return "relax"
+            return "chest_active"
+        if target == "deltoid" or "height" in text or "raise" in text or "drop" in text or "arm down" in text:
+            if state == "up" or "raise" in text or "arm up" in text:
+                return "raise"
+            if state == "down" or "drop" in text or "arm down" in text or "down" in text:
+                return "drop_down"
+            return "relax"
+        if "relax" in text or "rest" in text or "middle" in text:
+            return "relax"
+        return None
+
+    def get_current_action_image_key(self):
+        if self.is_calibrating and self.current_stage is not None:
+            return self.get_action_image_key_from_instruction(
+                self.current_stage.get("base_instruction", ""),
+                target=self.current_stage.get("target"),
+                label=self.current_stage.get("label"),
+                state=self.current_stage.get("state"),
+                action=self.current_stage.get("action"),
+            )
+        if self.is_testing and self.current_test_step is not None:
+            return self.get_action_image_key_from_instruction(
+                self.current_test_step.get("instruction", ""),
+                target=self.current_test_step.get("expected_muscle"),
+                state=self.current_test_step.get("expected_state"),
+            )
+        return None
+
+    def load_action_image(self, key):
+        if not key:
+            return None
+        if key in self.action_image_cache:
+            return self.action_image_cache[key]
+        filename = ACTION_IMAGE_FILES.get(key)
+        if not filename:
+            return None
+        path = os.path.join(ACTION_IMAGES_DIR, filename)
+        try:
+            img = Image.open(path).convert("RGBA")
+            img.thumbnail(ACTION_IMAGE_SIZE, Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.action_image_cache[key] = photo
+            return photo
+        except Exception as e:
+            print(f"Action image load failed for {path}: {e}")
+            return None
+
+    def update_action_image_display(self):
+        if not hasattr(self, "action_image_label") or self.action_image_label is None:
+            return
+
+        key = self.get_current_action_image_key()
+        if key == self.current_action_image_key:
+            return
+
+        self.current_action_image_key = key
+        if not key:
+            self.action_image_photo = None
+            self.action_image_title_var.set("Current Action")
+            self.action_image_label.configure(image="", text="No calibration/test action")
+            return
+
+        photo = self.load_action_image(key)
+        title = key.replace("_", " ").title()
+        self.action_image_title_var.set(title)
+        if photo is None:
+            self.action_image_photo = None
+            self.action_image_label.configure(image="", text=f"Missing image: {ACTION_IMAGE_FILES.get(key, key)}")
+        else:
+            self.action_image_photo = photo
+            self.action_image_label.configure(image=photo, text="")
 
     def draw_robot_model(self):
         self.draw_arm_model()
@@ -3738,6 +3875,7 @@ class EMGApp:
 
         if bool(self.graphics_enabled_var.get()):
             self.draw_robot_model()
+        self.update_action_image_display()
         self.root.after(UI_REFRESH_MS, self.update_ui_loop)
 
     def on_close(self):
